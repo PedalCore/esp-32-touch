@@ -1,0 +1,10 @@
+# ESP-IDF build artifacts & downloaded dependencies
+build/
+managed_components/
+sdkconfig
+sdkconfig.old
+dependencies.lock
+
+# OS / editor
+.DS_Store
+*.swp
