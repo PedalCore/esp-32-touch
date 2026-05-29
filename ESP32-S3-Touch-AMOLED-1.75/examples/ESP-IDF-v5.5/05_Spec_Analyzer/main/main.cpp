@@ -31,13 +31,22 @@ __attribute__((aligned(16))) static float spectrum[N_SAMPLES / 2];
 static float display_spectrum[STRIPE_COUNT];
 static float peak[STRIPE_COUNT];
 
-/* ============================ Karplus-Strong resonator ============================ */
-#define KS_MAX 1024                 /* covers pitches down to SR/1024 ≈ 15 Hz */
-static float    ks_buf[KS_MAX];     /* delay line (small enough for internal RAM) */
-static int      ks_w     = 0;       /* write index */
-static float    ks_lp    = 0.0f;    /* one-pole damping filter state (in feedback loop) */
-static int      pluck_n  = 0;       /* remaining samples of pluck noise burst */
-static uint32_t rng      = 0x1234567u;
+/* ============================ polyphonic Karplus-Strong ============================ */
+#define KS_MAX     1024             /* per-voice delay line */
+#define NUM_VOICES 6
+
+typedef struct {
+    float buf[KS_MAX];
+    int   w;
+    float lp;
+    float freq;
+    float delay;
+    int   pluck_n;
+    float energy;   /* leaky |output| — used for voice stealing */
+} voice_t;
+
+static voice_t   V[NUM_VOICES];
+static uint32_t  rng = 0x1234567u;
 
 static inline float frand(void)     /* fast white noise in [-1, 1) */
 {
@@ -45,15 +54,25 @@ static inline float frand(void)     /* fast white noise in [-1, 1) */
     return (float)(int32_t)rng * (1.0f / 2147483648.0f);
 }
 
-/* touch-controlled params (written by LVGL timer, read by audio task) */
-static volatile float g_pitch_hz = 220.0f;  /* set from top-half X */
-static volatile float g_cutoff   = 0.50f;   /* damping LPF coef, from bottom-half X */
-static volatile float g_feedback = 0.97f;   /* loop gain / sustain, from bottom-half Y */
-static volatile int   g_trigger  = 0;       /* 1 = pluck on next block */
-static volatile int   g_touch_x  = -1;
-static volatile int   g_touch_y  = -1;
+/* lock-free pluck queue (touch thread -> audio thread) */
+#define PEND_MAX 16
+static volatile float    pend_freq[PEND_MAX];
+static volatile uint32_t pend_w = 0, pend_r = 0;
 
-#define EXCITE 0.40f                /* how hard the mic drives the resonator */
+static inline void pluck_push(float f)
+{
+    uint32_t n = (pend_w + 1) & (PEND_MAX - 1);
+    if (n != pend_r) { pend_freq[pend_w] = f; pend_w = n; }
+}
+
+/* shared params */
+static volatile float g_cutoff    = 0.50f;  /* damping LPF coef (bottom-half X) */
+static volatile float g_feedback  = 0.97f;  /* loop gain / sustain (bottom-half Y) */
+static volatile int   g_finger_top = 0;     /* finger currently in the pitch zone */
+static volatile int   g_touch_x   = -1;
+static volatile int   g_touch_y   = -1;
+
+#define EXCITE 0.40f                /* how hard the mic drives the held voice */
 #define DRY    0.12f                /* a little dry mic so input is always audible */
 
 /* ---- scale / note quantisation (top half) ---- */
@@ -72,6 +91,16 @@ static inline float note_freq(int idx)
     return 440.0f * powf(2.0f, (float)(midi - 69) / 12.0f);
 }
 
+static int steal_voice(void)        /* pick the most-decayed voice */
+{
+    int best = 0;
+    float lo = V[0].energy;
+    for (int i = 1; i < NUM_VOICES; i++) {
+        if (V[i].energy < lo) { lo = V[i].energy; best = i; }
+    }
+    return best;
+}
+
 /* ============================ audio engine ============================ */
 static void audio_engine_task(void *arg)
 {
@@ -88,8 +117,10 @@ static void audio_engine_task(void *arg)
     int vset = 0;
     bsp_extra_codec_volume_set(90, &vset);
 
-    for (int i = 0; i < KS_MAX; i++) ks_buf[i] = 0.0f;
-    ESP_LOGI(TAG, "Karplus-Strong resonator ready");
+    memset(V, 0, sizeof(V));
+    for (int i = 0; i < NUM_VOICES; i++) { V[i].freq = 220.0f; V[i].delay = SAMPLE_RATE / 220.0f; }
+    int held = -1;
+    ESP_LOGI(TAG, "Polyphonic Karplus-Strong ready (%d voices)", NUM_VOICES);
 
     size_t br = 0, bw = 0;
     while (1) {
@@ -97,46 +128,56 @@ static void audio_engine_task(void *arg)
             continue;
         }
 
-        /* snapshot params for this block */
-        float freq = g_pitch_hz;
-        if (freq < 30.0f)  freq = 30.0f;
-        if (freq > 3000.0f) freq = 3000.0f;
-        float delay = (float)SAMPLE_RATE / freq;
-        if (delay < 2.0f)            delay = 2.0f;
-        if (delay > (KS_MAX - 2))    delay = KS_MAX - 2;
+        /* allocate any queued plucks to voices */
+        while (pend_r != pend_w) {
+            float f = pend_freq[pend_r];
+            pend_r = (pend_r + 1) & (PEND_MAX - 1);
+            int v = steal_voice();
+            float d = (float)SAMPLE_RATE / f;
+            if (d < 2.0f) d = 2.0f; else if (d > (KS_MAX - 2)) d = KS_MAX - 2;
+            V[v].freq = f;
+            V[v].delay = d;
+            V[v].pluck_n = (int)d;
+            V[v].energy = 1.0f;     /* mark busy so it isn't immediately stolen */
+            held = v;
+        }
+        bool finger_top = g_finger_top;
         float g   = g_feedback;
         float cut = g_cutoff;
-
-        if (g_trigger) { g_trigger = 0; pluck_n = (int)delay; }
 
         for (int i = 0; i < N_SAMPLES; i++) {
             float l = raw_data[i * CHANNELS]     / 32768.0f;
             float r = raw_data[i * CHANNELS + 1] / 32768.0f;
             float mic = 0.5f * (l + r);
 
-            /* fractional read from the delay line */
-            float rpos = (float)ks_w - delay;
-            while (rpos < 0.0f) rpos += KS_MAX;
-            int i0 = (int)rpos;
-            float frac = rpos - (float)i0;
-            int i1 = i0 + 1; if (i1 >= KS_MAX) i1 -= KS_MAX;
-            float d = ks_buf[i0] * (1.0f - frac) + ks_buf[i1] * frac;
+            float sum = 0.0f;
+            for (int v = 0; v < NUM_VOICES; v++) {
+                voice_t *vc = &V[v];
 
-            /* one-pole low-pass damping in the feedback loop */
-            ks_lp += cut * (d - ks_lp);
+                float rpos = (float)vc->w - vc->delay;
+                while (rpos < 0.0f) rpos += KS_MAX;
+                int i0 = (int)rpos;
+                float frac = rpos - (float)i0;
+                int i1 = i0 + 1; if (i1 >= KS_MAX) i1 -= KS_MAX;
+                float d = vc->buf[i0] * (1.0f - frac) + vc->buf[i1] * frac;
 
-            /* excitation: continuous mic + optional pluck noise burst */
-            float exc = EXCITE * mic;
-            if (pluck_n > 0) { exc += 0.9f * frand(); pluck_n--; }
+                vc->lp += cut * (d - vc->lp);
 
-            /* write back into the loop, soft-bounded so it can't blow up */
-            float v = exc + g * ks_lp;
-            if (v > 1.2f) v = 1.2f; else if (v < -1.2f) v = -1.2f;
-            ks_buf[ks_w] = v;
-            ks_w++; if (ks_w >= KS_MAX) ks_w = 0;
+                float exc = 0.0f;
+                if (finger_top && v == held) exc += EXCITE * mic;
+                if (vc->pluck_n > 0) { exc += 0.9f * frand(); vc->pluck_n--; }
 
-            /* output: resonator + a touch of dry mic */
-            float y = ks_lp + DRY * mic;
+                float nv = exc + g * vc->lp;
+                if (nv > 1.2f) nv = 1.2f; else if (nv < -1.2f) nv = -1.2f;
+                vc->buf[vc->w] = nv;
+                vc->w++; if (vc->w >= KS_MAX) vc->w = 0;
+
+                float o = vc->lp;
+                vc->energy += 0.001f * (fabsf(o) - vc->energy);
+                sum += o;
+            }
+
+            float y = sum * 0.6f + DRY * mic;
             if (y > 1.0f) y = 1.0f; else if (y < -1.0f) y = -1.0f;
             int16_t s = (int16_t)(y * 32767.0f);
             out_data[i * CHANNELS]     = s;
@@ -198,9 +239,8 @@ static void timer_cb(lv_timer_t *timer)
             in_top = true;
             int idx = (int)(tx * NUM_NOTES);
             if (idx < 0) idx = 0; else if (idx >= NUM_NOTES) idx = NUM_NOTES - 1;
-            g_pitch_hz = note_freq(idx);
             if (!prev_pressed || !prev_top || idx != g_active_note) {
-                g_trigger = 1;   /* fresh touch or new note zone -> pluck */
+                pluck_push(note_freq(idx));   /* fresh touch or new note zone -> pluck a voice */
             }
             g_active_note = idx;
         } else {
@@ -215,6 +255,7 @@ static void timer_cb(lv_timer_t *timer)
         g_touch_y = -1;
         g_active_note = -1;
     }
+    g_finger_top = in_top ? 1 : 0;
     prev_pressed = pressed;
     prev_top = in_top;
 
@@ -333,7 +374,7 @@ static void build_ui(void)
 
 extern "C" void app_main(void)
 {
-    ESP_LOGI(TAG, "Starting espSynth — Karplus-Strong resonator");
+    ESP_LOGI(TAG, "Starting espSynth — polyphonic Karplus-Strong resonator");
 
     lv_display_t *disp = bsp_display_start();
     if (disp) {
