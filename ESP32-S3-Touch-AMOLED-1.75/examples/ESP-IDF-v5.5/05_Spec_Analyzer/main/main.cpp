@@ -156,6 +156,7 @@ static volatile float g_cutoff     = 0.55f;  /* damping LPF coef -> "Brightness"
 static volatile float g_feedback   = 0.985f; /* loop gain        -> "Sustain"    */
 static volatile float g_excite     = 0.45f;  /* mic drive        -> "Mic Drive"  */
 static volatile float g_pluck      = 0.35f;  /* pluck attack amt -> "Pluck" (0 = mic only) */
+static volatile float g_breath     = 0.0f;   /* continuous shaped-noise breath -> "Breath" (blown sustain) */
 static volatile float g_volume     = 90.0f;  /* codec out vol    -> "Volume"     */
 static volatile int   g_finger_down = 0;     /* finger playing -> mic excites held voices */
 static volatile int   g_touch_x    = -1;
@@ -240,9 +241,11 @@ static void audio_engine_task(void *arg)
         float cut  = g_cutoff;
         float drive = g_excite;
         float pluck_amp = g_pluck;
+        float breath = g_breath;
         /* mic transient detector -> impulse excitation (persists across blocks) */
         static float env_f = 0.0f, env_s = 0.0f, imp_amp = 0.0f;
         static int   gate_refr = 0, imp_n = 0;
+        static float noise_lp = 0.0f;   /* shaped (low-passed) excitation noise */
 
         /* synth engine: AR envelope + per-voice gate (note held && finger down) */
         bool  synth  = synth_engine();
@@ -282,6 +285,10 @@ static void audio_engine_task(void *arg)
                 imp_n = 80; imp_amp = drive * 1.3f; gate_refr = 1200;   /* ~75 ms refractory */
             }
 
+            /* shaped excitation noise: brightness controls how airy the pluck/breath is */
+            float ncoef = 0.05f + cut * 0.55f;
+            noise_lp += ncoef * (frand() - noise_lp);
+
             float sum = 0.0f;
             for (int v = 0; v < NUM_VOICES; v++) {
                 voice_t *vc = &V[v];
@@ -311,7 +318,8 @@ static void audio_engine_task(void *arg)
                     vc->lp += cut * (d - vc->lp);
 
                     float exc = 0.0f;
-                    if (vc->pluck_n > 0) { exc += pluck_amp * frand(); vc->pluck_n--; }
+                    if (vc->pluck_n > 0) { exc += pluck_amp * noise_lp; vc->pluck_n--; }   /* shaped pluck */
+                    if (breath > 0.001f && vgate[v]) exc += breath * noise_lp;             /* blown sustain while held */
                     if (imp_n > 0) {   /* mic-transient impulse excites the held note(s) */
                         for (int j = 0; j < n_held; j++) if (held[j] == v) { exc += imp_amp * frand(); break; }
                     }
@@ -550,6 +558,7 @@ static param_t PAGE_RES[] = {
     { "Sustain",    &g_feedback, 0.90f, 0.999f, true  },
     { "Mic Drive",  &g_excite,   0.00f, 1.00f,  true  },
     { "Pluck",      &g_pluck,    0.00f, 1.00f,  true  },
+    { "Breath",     &g_breath,   0.00f, 1.00f,  true  },
     { "Volume",     &g_volume,   0.00f, 100.0f, false },
 };
 static param_t PAGE_SYN[] = {
@@ -576,8 +585,8 @@ static page_t PAGES[] = {
 static bool g_menu_open = false;
 static int  g_menu_page = 0;
 
-#define MENU_TOP    72
-#define MENU_ROW_H  76
+#define MENU_TOP    60
+#define MENU_ROW_H  66
 #define MENU_MARGIN 56
 
 static void menu_row_bounds(int i, int *y0, int *y1)   /* full touch row */
