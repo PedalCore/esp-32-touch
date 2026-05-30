@@ -62,10 +62,28 @@ typedef struct {
     float delay;
     int   pluck_n;
     float energy;
+    float phase;   /* synth osc phase 0..1 */
+    float env;     /* synth AR envelope 0..1 */
 } voice_t;
 
 static voice_t  V[NUM_VOICES];
 static uint32_t rng = 0x1234567u;
+
+/* ---- saw wavetable synth (raw osc + AR envelope) ---- */
+#define SAW_SIZE 1024
+static float saw_table[SAW_SIZE];
+static void build_saw(void) { for (int i = 0; i < SAW_SIZE; i++) saw_table[i] = -1.0f + 2.0f * (float)i / (float)SAW_SIZE; }
+static inline float saw_lerp(float ph)
+{
+    float pos = ph * SAW_SIZE;
+    int i0 = (int)pos & (SAW_SIZE - 1);
+    int i1 = (i0 + 1) & (SAW_SIZE - 1);
+    float fr = pos - (float)(int)pos;
+    return saw_table[i0] + fr * (saw_table[i1] - saw_table[i0]);
+}
+static volatile float g_attack    = 8.0f;    /* ms  */
+static volatile float g_release   = 280.0f;  /* ms  */
+static volatile float g_syn_level = 0.55f;   /* 0..1 */
 
 static inline float frand(void)
 {
@@ -115,9 +133,11 @@ static int   flg_w = 0;
 static float flg_phase = 0.0f;
 
 /* ---- play modes ---- */
-enum { MODE_TONNETZ, MODE_CHORD, MODE_XY, N_MODES };
-static const char *MODE_NAMES[] = { "Tonnetz", "Chords", "Keys+Spectrum" };
+enum { MODE_TONNETZ, MODE_CHORD, MODE_XY, MODE_SYNTH, MODE_OCARINA, N_MODES };
+static const char *MODE_NAMES[] = { "Tonnetz", "Chords", "Keys+Spectrum", "Synth", "Ocarina" };
 static volatile int g_mode = MODE_TONNETZ;
+/* Synth + Ocarina use the synth (saw+env) engine; others use Karplus */
+static inline bool synth_engine(void) { return g_mode == MODE_SYNTH || g_mode == MODE_OCARINA; }
 
 static int steal_voice(void)
 {
@@ -167,6 +187,7 @@ static void audio_engine_task(void *arg)
                 V[v].delay = d;
                 V[v].pluck_n = (int)d;
                 V[v].energy = 1.0f;
+                V[v].phase = 0.0f;
                 held[j] = v;
             }
         }
@@ -177,6 +198,19 @@ static void audio_engine_task(void *arg)
         /* mic transient detector -> impulse excitation (persists across blocks) */
         static float env_f = 0.0f, env_s = 0.0f, imp_amp = 0.0f;
         static int   gate_refr = 0, imp_n = 0;
+
+        /* synth engine: AR envelope + per-voice gate (note held && finger down) */
+        bool  synth  = synth_engine();
+        bool  fdown  = g_finger_down;
+        float atk    = 1.0f - expf(-1.0f / (fmaxf(0.5f, g_attack)  * 0.001f * SAMPLE_RATE));
+        float rel    = 1.0f - expf(-1.0f / (fmaxf(1.0f, g_release) * 0.001f * SAMPLE_RATE));
+        float slevel = g_syn_level;
+        bool  vgate[NUM_VOICES];
+        for (int v = 0; v < NUM_VOICES; v++) {
+            bool h = false;
+            for (int j = 0; j < n_held; j++) if (held[j] == v) { h = true; break; }
+            vgate[v] = h && fdown;
+        }
         float dly_t_ms = g_dly_time;
         float dly_fb   = g_dly_fb;
         float dly_mix  = g_dly_mix;
@@ -204,28 +238,41 @@ static void audio_engine_task(void *arg)
             float sum = 0.0f;
             for (int v = 0; v < NUM_VOICES; v++) {
                 voice_t *vc = &V[v];
+                float o;
 
-                float rpos = (float)vc->w - vc->delay;
-                while (rpos < 0.0f) rpos += KS_MAX;
-                int i0 = (int)rpos;
-                float frac = rpos - (float)i0;
-                int i1 = i0 + 1; if (i1 >= KS_MAX) i1 -= KS_MAX;
-                float d = vc->buf[i0] * (1.0f - frac) + vc->buf[i1] * frac;
+                if (synth) {
+                    /* ---- saw oscillator + AR envelope ---- */
+                    vc->phase += vc->freq / SAMPLE_RATE;
+                    if (vc->phase >= 1.0f) vc->phase -= 1.0f;
+                    float s = saw_lerp(vc->phase);
+                    float tgt = vgate[v] ? 1.0f : 0.0f;
+                    float c   = vgate[v] ? atk : rel;
+                    vc->env += c * (tgt - vc->env);
+                    o = s * vc->env * slevel;
+                } else {
+                    /* ---- Karplus-Strong resonator ---- */
+                    float rpos = (float)vc->w - vc->delay;
+                    while (rpos < 0.0f) rpos += KS_MAX;
+                    int i0 = (int)rpos;
+                    float frac = rpos - (float)i0;
+                    int i1 = i0 + 1; if (i1 >= KS_MAX) i1 -= KS_MAX;
+                    float d = vc->buf[i0] * (1.0f - frac) + vc->buf[i1] * frac;
 
-                vc->lp += cut * (d - vc->lp);
+                    vc->lp += cut * (d - vc->lp);
 
-                float exc = 0.0f;
-                if (vc->pluck_n > 0) { exc += pluck_amp * frand(); vc->pluck_n--; }
-                if (imp_n > 0) {   /* mic-transient impulse excites the held note(s) */
-                    for (int j = 0; j < n_held; j++) if (held[j] == v) { exc += imp_amp * frand(); break; }
+                    float exc = 0.0f;
+                    if (vc->pluck_n > 0) { exc += pluck_amp * frand(); vc->pluck_n--; }
+                    if (imp_n > 0) {   /* mic-transient impulse excites the held note(s) */
+                        for (int j = 0; j < n_held; j++) if (held[j] == v) { exc += imp_amp * frand(); break; }
+                    }
+
+                    float nv = exc + g * vc->lp;
+                    if (nv > 1.2f) nv = 1.2f; else if (nv < -1.2f) nv = -1.2f;
+                    vc->buf[vc->w] = nv;
+                    vc->w++; if (vc->w >= KS_MAX) vc->w = 0;
+                    o = vc->lp;
                 }
 
-                float nv = exc + g * vc->lp;
-                if (nv > 1.2f) nv = 1.2f; else if (nv < -1.2f) nv = -1.2f;
-                vc->buf[vc->w] = nv;
-                vc->w++; if (vc->w >= KS_MAX) vc->w = 0;
-
-                float o = vc->lp;
                 vc->energy += 0.001f * (fabsf(o) - vc->energy);
                 sum += o;
             }
@@ -264,8 +311,8 @@ static void audio_engine_task(void *arg)
         }
         bsp_extra_i2s_write(out_data, sizeof(out_data), &bw, portMAX_DELAY);
 
-        /* spectrum of the output (only needed by Keys+Spectrum mode) */
-        if (g_mode == MODE_XY) {
+        /* spectrum of the output (Keys+Spectrum and Synth modes show it) */
+        if (g_mode == MODE_XY || g_mode == MODE_SYNTH) {
             dsps_mul_f32(audio_buffer, wind, audio_buffer, N_SAMPLES, 1, 1, 1);
             for (int i = 0; i < N_SAMPLES; i++) { fft_buffer[2 * i] = audio_buffer[i]; fft_buffer[2 * i + 1] = 0; }
             dsps_fft2r_fc32(fft_buffer, N_SAMPLES);
@@ -429,6 +476,23 @@ static void build_vertices(void)
     ESP_LOGI(TAG, "chord vertices: %d", n_vtx);
 }
 
+/* ============================ Ocarina (5-note OoT layout) ============================ */
+#define OCA_N 5
+#define OCA_R 42
+static const int OCA_MIDI[OCA_N] = { 62, 65, 69, 71, 74 };   /* D4 F4 A4 B4 D5 */
+static const char *NOTE_NAMES[12] = { "C","C#","D","D#","E","F","F#","G","G#","A","A#","B" };
+static float oca_x[OCA_N], oca_y[OCA_N], oca_freq[OCA_N];
+
+static void build_ocarina(void)
+{
+    for (int i = 0; i < OCA_N; i++) {
+        oca_x[i] = 70.0f + (float)i * ((CANVAS_WIDTH - 140.0f) / (OCA_N - 1));
+        float t = (float)i / (OCA_N - 1) - 0.5f;
+        oca_y[i] = CANVAS_HEIGHT * 0.5f - 50.0f * cosf(t * 3.14159f);   /* gentle arc */
+        oca_freq[i] = midi_freq(OCA_MIDI[i]);
+    }
+}
+
 /* ============================ params menu ============================ */
 typedef struct { const char *name; volatile float *val; float lo, hi; bool as_pct; } param_t;
 static param_t PAGE_RES[] = {
@@ -438,6 +502,13 @@ static param_t PAGE_RES[] = {
     { "Pluck",      &g_pluck,    0.00f, 1.00f,  true  },
     { "Volume",     &g_volume,   0.00f, 100.0f, false },
 };
+static param_t PAGE_SYN[] = {
+    { "Attack",  &g_attack,    0.5f,  500.0f,  false },
+    { "Release", &g_release,   5.0f,  1000.0f, false },
+    { "Level",   &g_syn_level, 0.00f, 1.00f,   true  },
+    { "Volume",  &g_volume,    0.00f, 100.0f,  false },
+};
+#define N_SYN (int)(sizeof(PAGE_SYN) / sizeof(PAGE_SYN[0]))
 static param_t PAGE_FX[] = {
     { "Delay Time", &g_dly_time, 20.0f, 1000.0f, false },
     { "Delay Fbk",  &g_dly_fb,   0.00f, 0.90f,   true  },
@@ -464,9 +535,21 @@ static void menu_row_bounds(int i, int *y0, int *y1)   /* full touch row */
     *y1 = *y0 + MENU_ROW_H - 12;
 }
 
+/* page 1 is the "voice" page: shows Synth or Resonator params depending on engine */
+static param_t *voice_params(int page, int *n, const char **title)
+{
+    if (page == 1) {
+        if (synth_engine()) { *n = N_SYN; *title = "SYNTH"; return PAGE_SYN; }
+        *n = (int)(sizeof(PAGE_RES) / sizeof(PAGE_RES[0])); *title = "RESONATOR"; return PAGE_RES;
+    }
+    *n = PAGES[page].n; *title = PAGES[page].title; return PAGES[page].p;
+}
+
 static void draw_menu(lv_layer_t *layer, int page, int editing_row)
 {
     page_t *pg = &PAGES[page];
+    int pn; const char *ptitle;
+    param_t *plist = voice_params(page, &pn, &ptitle);
 
     lv_draw_rect_dsc_t bg;
     lv_draw_rect_dsc_init(&bg);
@@ -483,7 +566,7 @@ static void draw_menu(lv_layer_t *layer, int page, int editing_row)
     ld.align = LV_TEXT_ALIGN_CENTER;
     /* static: lv_draw_label keeps the text pointer until the layer is flushed */
     static char tbuf[40];
-    snprintf(tbuf, sizeof(tbuf), "%s   %s   %s", page > 0 ? "<" : " ", pg->title, page < N_PAGES - 1 ? ">" : " ");
+    snprintf(tbuf, sizeof(tbuf), "%s   %s   %s", page > 0 ? "<" : " ", ptitle, page < N_PAGES - 1 ? ">" : " ");
     ld.text = tbuf;
     lv_area_t title = { 0, 18, CANVAS_WIDTH - 1, 50 };
     lv_draw_label(layer, &ld, &title);
@@ -534,11 +617,11 @@ static void draw_menu(lv_layer_t *layer, int page, int editing_row)
         return;
     }
 
-    for (int i = 0; i < pg->n; i++) {
+    for (int i = 0; i < pn; i++) {
         int y0, y1;
         menu_row_bounds(i, &y0, &y1);
-        float v = *pg->p[i].val;
-        float t = (v - pg->p[i].lo) / (pg->p[i].hi - pg->p[i].lo);
+        float v = *plist[i].val;
+        float t = (v - plist[i].lo) / (plist[i].hi - plist[i].lo);
         if (t < 0) t = 0; else if (t > 1) t = 1;
         bool sel = (i == editing_row);
 
@@ -548,8 +631,8 @@ static void draw_menu(lv_layer_t *layer, int page, int editing_row)
         static char nmbuf[8][24];
         static char vbuf[8][16];
         int bi = (i < 8) ? i : 7;
-        snprintf(nmbuf[bi], sizeof(nmbuf[bi]), "%s", pg->p[i].name);
-        if (pg->p[i].as_pct) snprintf(vbuf[bi], sizeof(vbuf[bi]), "%d%%", (int)(t * 100.0f + 0.5f));
+        snprintf(nmbuf[bi], sizeof(nmbuf[bi]), "%s", plist[i].name);
+        if (plist[i].as_pct) snprintf(vbuf[bi], sizeof(vbuf[bi]), "%d%%", (int)(t * 100.0f + 0.5f));
         else                 snprintf(vbuf[bi], sizeof(vbuf[bi]), "%d", (int)v);
         ld.font = &lv_font_montserrat_20;
         ld.color = sel ? lv_color_white() : lv_color_hex(0xc0c8d0);
@@ -655,12 +738,14 @@ static void timer_cb(lv_timer_t *timer)
                     if (ty >= y0 - 6 && ty <= y0 + 54 + 6) { g_mode = m; break; }
                 }
             } else {
-                for (int i = 0; i < pg->n; i++) {
+                int epn; const char *etitle;
+                param_t *eplist = voice_params(g_menu_page, &epn, &etitle);
+                for (int i = 0; i < epn; i++) {
                     int y0, y1; menu_row_bounds(i, &y0, &y1);
                     if (ty >= y0 - 6 && ty <= y1 + 6) {
                         float t = (float)(tx - MENU_MARGIN) / (float)(CANVAS_WIDTH - 2 * MENU_MARGIN);
                         if (t < 0) t = 0; else if (t > 1) t = 1;
-                        *pg->p[i].val = pg->p[i].lo + t * (pg->p[i].hi - pg->p[i].lo);
+                        *eplist[i].val = eplist[i].lo + t * (eplist[i].hi - eplist[i].lo);
                         editing_row = i;
                         break;
                     }
@@ -675,8 +760,22 @@ static void timer_cb(lv_timer_t *timer)
 
     /* ---- PLAY mode ---- */
     bool play_touch = pressed && !gesture_consumed && ty < CANVAS_HEIGHT - NAV_H;
-    if (play_touch && g_mode == MODE_XY) {
-        /* Keys+Spectrum: top half = scale note (pentatonic, 3 oct), bottom half = filter */
+    if (play_touch && g_mode == MODE_OCARINA) {
+        /* Ocarina: 5 pads, hold to sound (gate) */
+        g_touch_x = tx; g_touch_y = ty;
+        int pad = -1;
+        for (int i = 0; i < OCA_N; i++) {
+            float dx = (float)tx - oca_x[i], dy = (float)ty - oca_y[i];
+            if (dx * dx + dy * dy < (float)((OCA_R + 12) * (OCA_R + 12))) { pad = i; break; }
+        }
+        if (pad >= 0) {
+            if (pad != g_active_note) { float f = oca_freq[pad]; chord_push(1, &f); g_active_note = pad; }
+            g_finger_down = 1;
+        } else {
+            g_active_note = -1; g_finger_down = 0; prev_sig = -1;
+        }
+    } else if (play_touch && (g_mode == MODE_XY || g_mode == MODE_SYNTH)) {
+        /* Keys+Spectrum / Synth: top half = scale note (pentatonic, 3 oct), bottom half = filter */
         g_touch_x = tx; g_touch_y = ty;
         const int cy = CANVAS_HEIGHT / 2;
         float txn = (float)tx / CANVAS_WIDTH;
@@ -741,8 +840,35 @@ static void timer_cb(lv_timer_t *timer)
     }
     prev_pressed = pressed;
 
-    if (g_mode == MODE_XY) {
-        /* ---- KEYS+SPECTRUM: output spectrum + pentatonic note strip ---- */
+    if (g_mode == MODE_OCARINA) {
+        /* ---- OCARINA: 5 note pads, active pad glows ---- */
+        for (int i = 0; i < OCA_N; i++) {
+            bool act = (g_active_note == i);
+            uint16_t hue = (uint16_t)((OCA_MIDI[i] % 12) * 30);
+            int rr = act ? OCA_R + 6 : OCA_R;
+            if (act) {   /* rainbow glow ring */
+                lv_draw_rect_dsc_t gl; lv_draw_rect_dsc_init(&gl);
+                gl.bg_opa = LV_OPA_TRANSP; gl.radius = LV_RADIUS_CIRCLE;
+                gl.border_color = lv_color_hsv_to_rgb(hue, 90, 100); gl.border_opa = LV_OPA_COVER; gl.border_width = 4;
+                int gr = rr + 14;
+                lv_area_t ga = { (int)oca_x[i] - gr, (int)oca_y[i] - gr, (int)oca_x[i] + gr, (int)oca_y[i] + gr };
+                lv_draw_rect(&layer, &gl, &ga);
+            }
+            lv_draw_rect_dsc_t pc; lv_draw_rect_dsc_init(&pc);
+            pc.bg_color = lv_color_hsv_to_rgb(hue, act ? 90 : 55, act ? 100 : 55);
+            pc.bg_opa = LV_OPA_COVER; pc.radius = LV_RADIUS_CIRCLE;
+            pc.border_color = lv_color_white(); pc.border_opa = LV_OPA_COVER; pc.border_width = act ? 4 : 2;
+            lv_area_t pa = { (int)oca_x[i] - rr, (int)oca_y[i] - rr, (int)oca_x[i] + rr, (int)oca_y[i] + rr };
+            lv_draw_rect(&layer, &pc, &pa);
+
+            lv_draw_label_dsc_t ld; lv_draw_label_dsc_init(&ld);
+            ld.font = &lv_font_montserrat_24; ld.color = lv_color_white(); ld.align = LV_TEXT_ALIGN_CENTER;
+            ld.text = NOTE_NAMES[OCA_MIDI[i] % 12];
+            lv_area_t la = { (int)oca_x[i] - rr, (int)oca_y[i] - 15, (int)oca_x[i] + rr, (int)oca_y[i] + 15 };
+            lv_draw_label(&layer, &ld, &la);
+        }
+    } else if (g_mode == MODE_XY || g_mode == MODE_SYNTH) {
+        /* ---- KEYS+SPECTRUM / SYNTH: output spectrum + pentatonic note strip ---- */
         const int cy = CANVAS_HEIGHT / 2;
         const int stripe_w = CANVAS_WIDTH / STRIPE_COUNT;
 
@@ -854,6 +980,8 @@ static void build_ui(void)
 
     build_hex_grid();
     build_vertices();
+    build_ocarina();
+    build_saw();
     lv_timer_create(timer_cb, 33, canvas);
 }
 
