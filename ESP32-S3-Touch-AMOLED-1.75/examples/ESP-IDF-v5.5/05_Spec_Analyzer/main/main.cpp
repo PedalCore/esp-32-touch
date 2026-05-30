@@ -562,22 +562,49 @@ static void build_vertices(void)
     ESP_LOGI(TAG, "chord vertices: %d", n_vtx);
 }
 
-/* ============================ Ocarina (5-note OoT layout) ============================ */
-#define OCA_N 5
-#define OCA_R 42
-static const int OCA_MIDI[OCA_N] = { 62, 65, 69, 71, 74 };   /* D4 F4 A4 B4 D5 */
+/* ============================ Ocarina (3-octave, 5 OoT notes) ============================ */
+#define OCA_COLS 5
+#define OCA_ROWS 3
+#define OCA_N    (OCA_COLS * OCA_ROWS)   /* 15 pads */
+#define OCA_R    32
+#define OCA_ROOT 50                      /* D3 */
+static const int8_t OCA_OFFS[OCA_COLS] = { 0, 3, 7, 9, 12 };  /* D F A B D' (OoT buttons) */
 static const char *NOTE_NAMES[12] = { "C","C#","D","D#","E","F","F#","G","G#","A","A#","B" };
 static float oca_x[OCA_N], oca_y[OCA_N], oca_freq[OCA_N];
+static int   oca_midi[OCA_N];
 
 static void build_ocarina(void)
 {
-    for (int i = 0; i < OCA_N; i++) {
-        oca_x[i] = 70.0f + (float)i * ((CANVAS_WIDTH - 140.0f) / (OCA_N - 1));
-        float t = (float)i / (OCA_N - 1) - 0.5f;
-        oca_y[i] = CANVAS_HEIGHT * 0.5f - 50.0f * cosf(t * 3.14159f);   /* gentle arc */
-        oca_freq[i] = midi_freq(OCA_MIDI[i]);
+    for (int r = 0; r < OCA_ROWS; r++) {
+        for (int c = 0; c < OCA_COLS; c++) {
+            int i = r * OCA_COLS + c;
+            int oct = (OCA_ROWS - 1) - r;     /* top row = highest octave */
+            oca_midi[i] = OCA_ROOT + oct * 12 + OCA_OFFS[c];
+            oca_freq[i] = midi_freq(oca_midi[i]);
+            oca_x[i] = 73.0f + c * 80.0f;
+            oca_y[i] = 112.0f + r * 124.0f;
+        }
     }
 }
+
+/* OoT jingles (creative names) as mid-octave button sequences (col 0..4 -> pads 5..9) */
+static const uint8_t SONG_LULLABY[] = { 3, 4, 2, 3, 4, 2 };
+static const uint8_t SONG_FOREST[]  = { 1, 2, 4, 1, 2, 4 };
+static const uint8_t SONG_HORSE[]   = { 4, 3, 2, 4, 3, 2 };
+static const uint8_t SONG_DAWN[]    = { 2, 1, 4, 2, 1, 4 };
+static const uint8_t SONG_TIME[]    = { 2, 0, 1, 2, 0, 1 };
+static const uint8_t SONG_STORM[]   = { 0, 1, 4, 0, 1, 4 };
+typedef struct { const char *name; const uint8_t *seq; int len; } song_t;
+static const song_t SONGS[] = {
+    { "Royal Lullaby", SONG_LULLABY, 6 },
+    { "Forest Air",    SONG_FOREST,  6 },
+    { "Horse Call",    SONG_HORSE,   6 },
+    { "Dawn Hymn",     SONG_DAWN,    6 },
+    { "Time Spiral",   SONG_TIME,    6 },
+    { "Tempest",       SONG_STORM,   6 },
+};
+#define N_SONGS (int)(sizeof(SONGS) / sizeof(SONGS[0]))
+static volatile int g_song_sel = 0;
 
 /* ============================ params menu ============================ */
 typedef struct { const char *name; volatile float *val; float lo, hi; bool as_pct; const char **names; int nnames; } param_t;
@@ -858,21 +885,48 @@ static void timer_cb(lv_timer_t *timer)
         return;
     }
 
+    /* ---- ocarina jingle player (auto-plays a song, lights the pads) ---- */
+    static int song_play = 0, song_pos = 0, song_ms = 0;
+    if (g_mode != MODE_OCARINA) song_play = 0;
+    if (song_play) {
+        song_ms -= 33;
+        if (song_ms <= 0) {
+            const song_t *sg = &SONGS[g_song_sel];
+            if (song_pos >= sg->len) { song_play = 0; g_finger_down = 0; g_active_note = -1; prev_sig = -1; }
+            else {
+                int pad = OCA_COLS + sg->seq[song_pos];   /* mid-octave row */
+                float f = oca_freq[pad];
+                chord_push(1, &f);
+                g_finger_down = 1; g_active_note = pad;
+                song_pos++; song_ms = 360;
+            }
+        }
+    }
+
     /* ---- PLAY mode ---- */
     bool play_touch = pressed && !gesture_consumed && ty < CANVAS_HEIGHT - NAV_H;
     if (play_touch && g_mode == MODE_OCARINA) {
-        /* Ocarina: 5 pads, hold to sound (gate) */
         g_touch_x = tx; g_touch_y = ty;
-        int pad = -1;
-        for (int i = 0; i < OCA_N; i++) {
-            float dx = (float)tx - oca_x[i], dy = (float)ty - oca_y[i];
-            if (dx * dx + dy * dy < (float)((OCA_R + 12) * (OCA_R + 12))) { pad = i; break; }
-        }
-        if (pad >= 0) {
-            if (pad != g_active_note) { float f = oca_freq[pad]; chord_push(1, &f); g_active_note = pad; }
-            g_finger_down = 1;
+        if (ty < 72) {
+            if (!prev_pressed) {   /* song bar — edge-triggered */
+                if (tx < 110)                     g_song_sel = (g_song_sel + N_SONGS - 1) % N_SONGS;
+                else if (tx > CANVAS_WIDTH - 110)  g_song_sel = (g_song_sel + 1) % N_SONGS;
+                else { song_play = !song_play; song_pos = 0; song_ms = 0;
+                       if (!song_play) { g_finger_down = 0; g_active_note = -1; } }
+            }
         } else {
-            g_active_note = -1; g_finger_down = 0; prev_sig = -1;
+            int pad = -1;
+            for (int i = 0; i < OCA_N; i++) {
+                float dx = (float)tx - oca_x[i], dy = (float)ty - oca_y[i];
+                if (dx * dx + dy * dy < (float)((OCA_R + 6) * (OCA_R + 6))) { pad = i; break; }
+            }
+            if (pad >= 0) {
+                song_play = 0;   /* manual touch stops the jingle */
+                if (pad != g_active_note) { float f = oca_freq[pad]; chord_push(1, &f); g_active_note = pad; }
+                g_finger_down = 1;
+            } else if (!song_play) {
+                g_active_note = -1; g_finger_down = 0; prev_sig = -1;
+            }
         }
     } else if (play_touch && g_mode == MODE_SYNTH) {
         /* Synth 2D pad: X = scale note, Y = warp morph (real-time waveshaping) */
@@ -943,37 +997,52 @@ static void timer_cb(lv_timer_t *timer)
     } else {
         g_touch_x = -1;
         g_touch_y = -1;
-        g_finger_down = 0;
-        prev_sig = -1;
-        g_active_note = -1;
+        if (!song_play) {   /* don't kill an auto-playing jingle */
+            g_finger_down = 0;
+            prev_sig = -1;
+            g_active_note = -1;
+        }
     }
     prev_pressed = pressed;
 
     if (g_mode == MODE_OCARINA) {
-        /* ---- OCARINA: 5 note pads, active pad glows ---- */
+        /* ---- song bar: <  Name  >  (tap title to auto-play) ---- */
+        static char sbuf[48];
+        snprintf(sbuf, sizeof(sbuf), "<   %s   >", SONGS[g_song_sel].name);
+        lv_draw_label_dsc_t sb; lv_draw_label_dsc_init(&sb);
+        sb.font = &lv_font_montserrat_24; sb.color = lv_color_white(); sb.align = LV_TEXT_ALIGN_CENTER;
+        sb.text = sbuf;
+        lv_area_t sba = { 0, 20, CANVAS_WIDTH - 1, 50 };
+        lv_draw_label(&layer, &sb, &sba);
+        sb.font = &lv_font_montserrat_20; sb.color = lv_color_hex(0x808890);
+        sb.text = "tap title to play";
+        lv_area_t sh = { 0, 52, CANVAS_WIDTH - 1, 72 };
+        lv_draw_label(&layer, &sb, &sh);
+
+        /* ---- 15 pads (3 octaves x 5 notes), active pad glows ---- */
         for (int i = 0; i < OCA_N; i++) {
             bool act = (g_active_note == i);
-            uint16_t hue = (uint16_t)((OCA_MIDI[i] % 12) * 30);
-            int rr = act ? OCA_R + 6 : OCA_R;
-            if (act) {   /* rainbow glow ring */
+            uint16_t hue = (uint16_t)((oca_midi[i] % 12) * 30);
+            int rr = act ? OCA_R + 5 : OCA_R;
+            if (act) {
                 lv_draw_rect_dsc_t gl; lv_draw_rect_dsc_init(&gl);
                 gl.bg_opa = LV_OPA_TRANSP; gl.radius = LV_RADIUS_CIRCLE;
                 gl.border_color = lv_color_hsv_to_rgb(hue, 90, 100); gl.border_opa = LV_OPA_COVER; gl.border_width = 4;
-                int gr = rr + 14;
+                int gr = rr + 10;
                 lv_area_t ga = { (int)oca_x[i] - gr, (int)oca_y[i] - gr, (int)oca_x[i] + gr, (int)oca_y[i] + gr };
                 lv_draw_rect(&layer, &gl, &ga);
             }
             lv_draw_rect_dsc_t pc; lv_draw_rect_dsc_init(&pc);
-            pc.bg_color = lv_color_hsv_to_rgb(hue, act ? 90 : 55, act ? 100 : 55);
+            pc.bg_color = lv_color_hsv_to_rgb(hue, act ? 90 : 55, act ? 100 : 50);
             pc.bg_opa = LV_OPA_COVER; pc.radius = LV_RADIUS_CIRCLE;
             pc.border_color = lv_color_white(); pc.border_opa = LV_OPA_COVER; pc.border_width = act ? 4 : 2;
             lv_area_t pa = { (int)oca_x[i] - rr, (int)oca_y[i] - rr, (int)oca_x[i] + rr, (int)oca_y[i] + rr };
             lv_draw_rect(&layer, &pc, &pa);
 
             lv_draw_label_dsc_t ld; lv_draw_label_dsc_init(&ld);
-            ld.font = &lv_font_montserrat_24; ld.color = lv_color_white(); ld.align = LV_TEXT_ALIGN_CENTER;
-            ld.text = NOTE_NAMES[OCA_MIDI[i] % 12];
-            lv_area_t la = { (int)oca_x[i] - rr, (int)oca_y[i] - 15, (int)oca_x[i] + rr, (int)oca_y[i] + 15 };
+            ld.font = &lv_font_montserrat_20; ld.color = lv_color_white(); ld.align = LV_TEXT_ALIGN_CENTER;
+            ld.text = NOTE_NAMES[oca_midi[i] % 12];
+            lv_area_t la = { (int)oca_x[i] - rr, (int)oca_y[i] - 13, (int)oca_x[i] + rr, (int)oca_y[i] + 13 };
             lv_draw_label(&layer, &ld, &la);
         }
     } else if (g_mode == MODE_XY || g_mode == MODE_SYNTH) {
