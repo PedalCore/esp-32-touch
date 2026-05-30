@@ -97,6 +97,12 @@ static volatile float g_warpmode = 0.0f;   /* stepped 0..N_WARP-1 */
 static volatile float g_warp_base = 0.0f;  /* menu base warp 0..1 */
 static volatile float g_warp_live = 0.0f;  /* live morph from Synth-mode Y */
 
+/* ---- IMU (QMI8658) motion modulation ---- */
+static volatile float g_imu_x = 0.0f;      /* tilt L/R  -1..1 */
+static volatile float g_imu_y = 0.0f;      /* tilt F/B  -1..1 */
+static volatile float g_bend  = 1.0f;      /* pitch-bend ratio from tilt-X */
+static volatile float g_imu_amt = 0.0f;    /* motion-mod depth 0..1 (menu) */
+
 static inline float w_clamp01(float x) { return x < 0 ? 0 : (x > 1 ? 1 : x); }
 static inline float w_lerp(float a, float b, float t) { return a + (b - a) * t; }
 static inline float w_bias(float b, float x) {
@@ -237,8 +243,10 @@ static void audio_engine_task(void *arg)
                 held[j] = v;
             }
         }
+        float imy  = g_imu_y * g_imu_amt;                       /* tilt F/B -> timbre */
+        float bend = 1.0f + (g_bend - 1.0f) * g_imu_amt;        /* tilt L/R -> pitch */
         float g    = g_feedback;
-        float cut  = g_cutoff;
+        float cut  = w_clamp01(g_cutoff + imy * 0.30f);
         float drive = g_excite;
         float pluck_amp = g_pluck;
         float breath = g_breath;
@@ -254,7 +262,7 @@ static void audio_engine_task(void *arg)
         float rel    = 1.0f - expf(-1.0f / (fmaxf(1.0f, g_release) * 0.001f * SAMPLE_RATE));
         float slevel = g_syn_level;
         int   wmode  = (int)(g_warpmode + 0.5f); if (wmode < 0) wmode = 0; else if (wmode >= N_WARP) wmode = N_WARP - 1;
-        float warp_eff = w_clamp01(g_warp_base + g_warp_live);
+        float warp_eff = w_clamp01(g_warp_base + g_warp_live + imy * 0.50f);
         bool  vgate[NUM_VOICES];
         for (int v = 0; v < NUM_VOICES; v++) {
             bool h = false;
@@ -296,9 +304,9 @@ static void audio_engine_task(void *arg)
 
                 if (synth) {
                     /* ---- warp oscillator + AR envelope ---- */
-                    vc->phase += vc->freq / SAMPLE_RATE;
+                    vc->phase += vc->freq * bend / SAMPLE_RATE;
                     if (vc->phase >= 1.0f) vc->phase -= 1.0f;
-                    vc->modphase += vc->freq * 2.0f / SAMPLE_RATE;
+                    vc->modphase += vc->freq * 2.0f * bend / SAMPLE_RATE;
                     if (vc->modphase >= 1.0f) vc->modphase -= 1.0f;
                     float mod = sinf(6.2831853f * vc->modphase);
                     float s = osc_warp(vc->phase, warp_eff, mod, wmode);
@@ -308,7 +316,7 @@ static void audio_engine_task(void *arg)
                     o = s * vc->env * slevel;
                 } else {
                     /* ---- Karplus-Strong resonator ---- */
-                    float rpos = (float)vc->w - vc->delay;
+                    float rpos = (float)vc->w - vc->delay / bend;
                     while (rpos < 0.0f) rpos += KS_MAX;
                     int i0 = (int)rpos;
                     float frac = rpos - (float)i0;
@@ -574,12 +582,13 @@ static param_t PAGE_FX[] = {
     { "Delay Fbk",  &g_dly_fb,   0.00f, 0.90f,   true  },
     { "Delay Mix",  &g_dly_mix,  0.00f, 1.00f,   true  },
     { "Flanger",    &g_flg_amt,  0.00f, 1.00f,   true  },
+    { "Motion",     &g_imu_amt,  0.00f, 1.00f,   true  },
 };
 typedef struct { const char *title; param_t *p; int n; } page_t;
 static page_t PAGES[] = {
     { "MODE",      NULL,     0 },   /* special: mode selector */
-    { "RESONATOR", PAGE_RES, 5 },
-    { "FX",        PAGE_FX,  4 },
+    { "RESONATOR", PAGE_RES, 6 },
+    { "FX",        PAGE_FX,  5 },
 };
 #define N_PAGES (int)(sizeof(PAGES) / sizeof(PAGES[0]))
 static bool g_menu_open = false;
@@ -1060,6 +1069,76 @@ static void build_ui(void)
     lv_timer_create(timer_cb, 33, canvas);
 }
 
+/* ============================ IMU: QMI8658 over BSP I2C ============================ */
+static i2c_master_dev_handle_t imu_dev = NULL;
+
+static esp_err_t imu_w(uint8_t reg, uint8_t val)
+{
+    uint8_t b[2] = { reg, val };
+    return i2c_master_transmit(imu_dev, b, 2, 100);
+}
+static esp_err_t imu_r(uint8_t reg, uint8_t *buf, size_t n)
+{
+    return i2c_master_transmit_receive(imu_dev, &reg, 1, buf, n, 100);
+}
+
+static bool imu_init(void)
+{
+    i2c_master_bus_handle_t bus = bsp_i2c_get_handle();
+    if (!bus) return false;
+    const uint8_t addrs[2] = { 0x6B, 0x6A };
+    for (int a = 0; a < 2; a++) {
+        if (imu_dev) { i2c_master_bus_rm_device(imu_dev); imu_dev = NULL; }
+        i2c_device_config_t cfg = {};
+        cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
+        cfg.device_address = addrs[a];
+        cfg.scl_speed_hz = 400000;
+        if (i2c_master_bus_add_device(bus, &cfg, &imu_dev) != ESP_OK) continue;
+        uint8_t who = 0;
+        if (imu_r(0x00, &who, 1) == ESP_OK && who == 0x05) {
+            imu_w(0x60, 0xB0); vTaskDelay(pdMS_TO_TICKS(15));   /* reset */
+            imu_w(0x02, 0x40);   /* CTRL1: addr auto-increment, little-endian */
+            imu_w(0x03, 0x15);   /* CTRL2: accel +-4g, 250 Hz */
+            imu_w(0x04, 0x55);   /* CTRL3: gyro +-512 dps, 250 Hz */
+            imu_w(0x08, 0x03);   /* CTRL7: enable accel + gyro */
+            ESP_LOGI(TAG, "QMI8658 IMU found at 0x%02X", addrs[a]);
+            return true;
+        }
+    }
+    ESP_LOGE(TAG, "QMI8658 IMU not found");
+    return false;
+}
+
+static void imu_task(void *arg)
+{
+    vTaskDelay(pdMS_TO_TICKS(400));   /* let BSP bring up I2C */
+    if (!imu_init()) { vTaskDelete(NULL); return; }
+
+    float ax0 = 0, ay0 = 0; bool based = false;
+    float fx = 0, fy = 0;
+    while (1) {
+        uint8_t b[6];
+        if (imu_r(0x35, b, 6) == ESP_OK) {
+            int16_t rax = (int16_t)(b[0] | (b[1] << 8));
+            int16_t ray = (int16_t)(b[2] | (b[3] << 8));
+            float gx = rax / 8192.0f;   /* +-4g -> 8192 LSB/g */
+            float gy = ray / 8192.0f;
+            if (!based) { ax0 = gx; ay0 = gy; based = true; }   /* resting orientation = neutral */
+            float dx = gx - ax0, dy = gy - ay0;
+            if (fabsf(dx) < 0.04f) dx = 0;   /* deadzone */
+            if (fabsf(dy) < 0.04f) dy = 0;
+            fx += 0.25f * (dx - fx);
+            fy += 0.25f * (dy - fy);
+            float ix = fx * 1.6f; if (ix > 1) ix = 1; else if (ix < -1) ix = -1;
+            float iy = fy * 1.6f; if (iy > 1) iy = 1; else if (iy < -1) iy = -1;
+            g_imu_x = ix;
+            g_imu_y = iy;
+            g_bend = powf(2.0f, ix * 2.0f / 12.0f);   /* +-2 semitones */
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));   /* ~100 Hz */
+    }
+}
+
 extern "C" void app_main(void)
 {
     ESP_LOGI(TAG, "Starting espSynth — Tonnetz hex synth");
@@ -1074,4 +1153,5 @@ extern "C" void app_main(void)
     bsp_display_unlock();
 
     xTaskCreate(audio_engine_task, "audio_engine", 8 * 1024, NULL, 5, NULL);
+    xTaskCreate(imu_task, "imu", 4 * 1024, NULL, 4, NULL);
 }
