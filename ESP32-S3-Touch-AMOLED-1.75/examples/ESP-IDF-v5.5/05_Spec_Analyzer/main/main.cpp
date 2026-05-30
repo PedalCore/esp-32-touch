@@ -85,6 +85,9 @@ static inline float saw_lerp(float ph)
 static volatile float g_attack    = 8.0f;    /* ms  */
 static volatile float g_release   = 280.0f;  /* ms  */
 static volatile float g_syn_level = 0.55f;   /* 0..1 */
+static volatile float g_syn_cut   = 0.65f;   /* base LPF cutoff (norm) -> "Cutoff" */
+static volatile float g_reso      = 0.15f;   /* LPF resonance 0..1     -> "Resonance" */
+static volatile float g_cut_live  = 0.60f;   /* Synth-mode Y cutoff (live) */
 
 /* ---- wavetable warp / waveshaping (ported from SerumLikeOsc::readWarped) ---- */
 enum { W_NONE, W_SYNC, W_BEND_P, W_BEND_M, W_BEND_PM, W_PWM,
@@ -101,7 +104,9 @@ static volatile float g_warp_live = 0.0f;  /* live morph from Synth-mode Y */
 static volatile float g_imu_x = 0.0f;      /* tilt L/R  -1..1 */
 static volatile float g_imu_y = 0.0f;      /* tilt F/B  -1..1 */
 static volatile float g_bend  = 1.0f;      /* pitch-bend ratio from tilt-X */
-static volatile float g_imu_amt = 0.0f;    /* motion-mod depth 0..1 (menu) */
+static volatile float g_imu_amt = 0.0f;    /* motion-mod master depth 0..1 */
+static volatile float g_imu_pitch = 1.0f;  /* tilt-X -> pitch amount */
+static volatile float g_imu_filt  = 1.0f;  /* tilt-Y -> filter/brightness amount */
 
 static inline float w_clamp01(float x) { return x < 0 ? 0 : (x > 1 ? 1 : x); }
 static inline float w_lerp(float a, float b, float t) { return a + (b - a) * t; }
@@ -239,12 +244,12 @@ static void audio_engine_task(void *arg)
                 V[v].delay = d;
                 V[v].pluck_n = (int)d;
                 V[v].energy = 1.0f;
-                V[v].phase = 0.0f;
                 held[j] = v;
             }
         }
-        float imy  = g_imu_y * g_imu_amt;                       /* tilt F/B -> timbre */
-        float bend = 1.0f + (g_bend - 1.0f) * g_imu_amt;        /* tilt L/R -> pitch */
+        float imy  = g_imu_y * g_imu_amt;                            /* tilt F/B -> timbre */
+        float bend = 1.0f + (g_bend - 1.0f) * g_imu_amt * g_imu_pitch; /* tilt L/R -> pitch */
+        static float svf_ic1 = 0.0f, svf_ic2 = 0.0f;                 /* SVF state */
         float g    = g_feedback;
         float cut  = w_clamp01(g_cutoff + imy * 0.30f);
         float drive = g_excite;
@@ -261,8 +266,17 @@ static void audio_engine_task(void *arg)
         float atk    = 1.0f - expf(-1.0f / (fmaxf(0.5f, g_attack)  * 0.001f * SAMPLE_RATE));
         float rel    = 1.0f - expf(-1.0f / (fmaxf(1.0f, g_release) * 0.001f * SAMPLE_RATE));
         float slevel = g_syn_level;
-        int   wmode  = (int)(g_warpmode + 0.5f); if (wmode < 0) wmode = 0; else if (wmode >= N_WARP) wmode = N_WARP - 1;
-        float warp_eff = w_clamp01(g_warp_base + g_warp_live + imy * 0.50f);
+        /* synth resonant low-pass (TPT SVF) coefficients — cutoff from menu/Synth-Y + motion */
+        float base_cut = (g_mode == MODE_SYNTH && fdown) ? g_cut_live : g_syn_cut;
+        float cnorm = base_cut + imy * g_imu_filt * 0.5f;
+        if (cnorm < 0) cnorm = 0; else if (cnorm > 1) cnorm = 1;
+        float fc = 80.0f * powf(2.0f, cnorm * 6.4f);
+        if (fc > SAMPLE_RATE * 0.45f) fc = SAMPLE_RATE * 0.45f;
+        float svf_g = tanf(3.14159265f * fc / SAMPLE_RATE);
+        float svf_k = 1.0f / (0.5f + g_reso * 9.5f);
+        float svf_a1 = 1.0f / (1.0f + svf_g * (svf_g + svf_k));
+        float svf_a2 = svf_g * svf_a1;
+        float svf_a3 = svf_g * svf_a2;
         bool  vgate[NUM_VOICES];
         for (int v = 0; v < NUM_VOICES; v++) {
             bool h = false;
@@ -303,13 +317,10 @@ static void audio_engine_task(void *arg)
                 float o;
 
                 if (synth) {
-                    /* ---- warp oscillator + AR envelope ---- */
+                    /* ---- saw oscillator + AR envelope (resonant LPF on the sum) ---- */
                     vc->phase += vc->freq * bend / SAMPLE_RATE;
                     if (vc->phase >= 1.0f) vc->phase -= 1.0f;
-                    vc->modphase += vc->freq * 2.0f * bend / SAMPLE_RATE;
-                    if (vc->modphase >= 1.0f) vc->modphase -= 1.0f;
-                    float mod = sinf(6.2831853f * vc->modphase);
-                    float s = osc_warp(vc->phase, warp_eff, mod, wmode);
+                    float s = saw_lerp(vc->phase);
                     float tgt = vgate[v] ? 1.0f : 0.0f;
                     float c   = vgate[v] ? atk : rel;
                     vc->env += c * (tgt - vc->env);
@@ -344,6 +355,15 @@ static void audio_engine_task(void *arg)
             }
 
             if (imp_n > 0) imp_n--;
+
+            if (synth) {   /* resonant low-pass on the synth mix */
+                float v3 = sum - svf_ic2;
+                float v1 = svf_a1 * svf_ic1 + svf_a2 * v3;
+                float v2 = svf_ic2 + svf_a2 * svf_ic1 + svf_a3 * v3;
+                svf_ic1 = 2.0f * v1 - svf_ic1;
+                svf_ic2 = 2.0f * v2 - svf_ic2;
+                sum = v2;
+            }
 
             float y = sum * 0.6f + DRY * mic;
 
@@ -570,25 +590,30 @@ static param_t PAGE_RES[] = {
     { "Volume",     &g_volume,   0.00f, 100.0f, false },
 };
 static param_t PAGE_SYN[] = {
-    { "Attack",  &g_attack,    0.5f,  500.0f,            false },
-    { "Release", &g_release,   5.0f,  1000.0f,           false },
-    { "Shape",   &g_warpmode,  0.0f,  (float)(N_WARP-1), false, WARP_NAMES, N_WARP },
-    { "Warp",    &g_warp_base, 0.00f, 1.00f,             true  },
-    { "Volume",  &g_volume,    0.00f, 100.0f,            false },
+    { "Attack",    &g_attack,  0.5f,  500.0f,  false },
+    { "Release",   &g_release, 5.0f,  1000.0f, false },
+    { "Cutoff",    &g_syn_cut, 0.00f, 1.00f,   true  },
+    { "Resonance", &g_reso,    0.00f, 1.00f,   true  },
+    { "Volume",    &g_volume,  0.00f, 100.0f,  false },
 };
 #define N_SYN (int)(sizeof(PAGE_SYN) / sizeof(PAGE_SYN[0]))
+static param_t PAGE_MOTION[] = {
+    { "Depth",  &g_imu_amt,   0.00f, 1.00f, true },
+    { "Pitch",  &g_imu_pitch, 0.00f, 1.00f, true },
+    { "Filter", &g_imu_filt,  0.00f, 1.00f, true },
+};
 static param_t PAGE_FX[] = {
     { "Delay Time", &g_dly_time, 20.0f, 1000.0f, false },
     { "Delay Fbk",  &g_dly_fb,   0.00f, 0.90f,   true  },
     { "Delay Mix",  &g_dly_mix,  0.00f, 1.00f,   true  },
     { "Flanger",    &g_flg_amt,  0.00f, 1.00f,   true  },
-    { "Motion",     &g_imu_amt,  0.00f, 1.00f,   true  },
 };
 typedef struct { const char *title; param_t *p; int n; } page_t;
 static page_t PAGES[] = {
-    { "MODE",      NULL,     0 },   /* special: mode selector */
-    { "RESONATOR", PAGE_RES, 6 },
-    { "FX",        PAGE_FX,  5 },
+    { "MODE",      NULL,        0 },   /* special: mode selector */
+    { "RESONATOR", PAGE_RES,    6 },
+    { "FX",        PAGE_FX,     4 },
+    { "MOTION",    PAGE_MOTION, 3 },
 };
 #define N_PAGES (int)(sizeof(PAGES) / sizeof(PAGES[0]))
 static bool g_menu_open = false;
@@ -856,7 +881,7 @@ static void timer_cb(lv_timer_t *timer)
         float yn = (float)ty / (float)(CANVAS_HEIGHT - NAV_H); if (yn < 0) yn = 0; else if (yn > 1) yn = 1;
         int idx = (int)(xn * XY_NOTES); if (idx < 0) idx = 0; else if (idx >= XY_NOTES) idx = XY_NOTES - 1;
         if (idx != g_active_note) { float f = xy_note_freq(idx); chord_push(1, &f); g_active_note = idx; }
-        g_warp_live = yn;
+        g_cut_live = 1.0f - yn;   /* top = bright (open filter), bottom = dark */
         g_finger_down = 1;
     } else if (play_touch && g_mode == MODE_XY) {
         /* Keys+Spectrum: top half = scale note (pentatonic, 3 oct), bottom half = filter */
