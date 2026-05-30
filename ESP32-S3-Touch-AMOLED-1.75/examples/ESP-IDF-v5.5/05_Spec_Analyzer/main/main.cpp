@@ -16,14 +16,19 @@
 #define N_SAMPLES 1024
 #define SAMPLE_RATE 16000
 #define CHANNELS 2
-#define STRIPE_COUNT 64
 
-#define CANVAS_WIDTH BSP_LCD_H_RES   /* 466 — fill the round AMOLED */
-#define CANVAS_HEIGHT BSP_LCD_V_RES  /* 466 */
+#define CANVAS_WIDTH  BSP_LCD_H_RES   /* 466 */
+#define CANVAS_HEIGHT BSP_LCD_V_RES   /* 466 */
 
-/* ---- audio + FFT buffers ---- */
+#define NAV_H        44               /* reserved bottom strip: swipe-up handle */
+#define SWIPE_THRESH 45               /* px of vertical drag to open/close menu */
+
+/* ---- audio I/O buffers ---- */
 __attribute__((aligned(16))) static int16_t raw_data[N_SAMPLES * CHANNELS];
 __attribute__((aligned(16))) static int16_t out_data[N_SAMPLES * CHANNELS];
+
+/* ---- FFT spectrum (Keys+Spectrum mode) ---- */
+#define STRIPE_COUNT 64
 __attribute__((aligned(16))) static float audio_buffer[N_SAMPLES];
 __attribute__((aligned(16))) static float wind[N_SAMPLES];
 __attribute__((aligned(16))) static float fft_buffer[N_SAMPLES * 2];
@@ -31,8 +36,22 @@ __attribute__((aligned(16))) static float spectrum[N_SAMPLES / 2];
 static float display_spectrum[STRIPE_COUNT];
 static float peak[STRIPE_COUNT];
 
+/* ---- scale strip (Keys+Spectrum mode) ---- */
+static const int8_t SCALE[] = { 0, 2, 4, 7, 9 };   /* major pentatonic */
+#define SCALE_LEN  (int)(sizeof(SCALE) / sizeof(SCALE[0]))
+#define XY_OCTAVES 3
+#define XY_ROOT    48                               /* C3 */
+#define XY_NOTES   (SCALE_LEN * XY_OCTAVES)         /* 15 zones */
+static volatile int g_active_note = -1;
+static inline float xy_note_freq(int idx)
+{
+    int oct = idx / SCALE_LEN, deg = idx % SCALE_LEN;
+    int midi = XY_ROOT + oct * 12 + SCALE[deg];
+    return 440.0f * powf(2.0f, (float)(midi - 69) / 12.0f);
+}
+
 /* ============================ polyphonic Karplus-Strong ============================ */
-#define KS_MAX     1024             /* per-voice delay line */
+#define KS_MAX     1024
 #define NUM_VOICES 6
 
 typedef struct {
@@ -42,56 +61,65 @@ typedef struct {
     float freq;
     float delay;
     int   pluck_n;
-    float energy;   /* leaky |output| — used for voice stealing */
+    float energy;
 } voice_t;
 
-static voice_t   V[NUM_VOICES];
-static uint32_t  rng = 0x1234567u;
+static voice_t  V[NUM_VOICES];
+static uint32_t rng = 0x1234567u;
 
-static inline float frand(void)     /* fast white noise in [-1, 1) */
+static inline float frand(void)
 {
     rng = rng * 1664525u + 1013904223u;
     return (float)(int32_t)rng * (1.0f / 2147483648.0f);
 }
 
-/* lock-free pluck queue (touch thread -> audio thread) */
+/* lock-free chord queue (touch thread -> audio thread): up to 3 notes per gesture */
 #define PEND_MAX 16
-static volatile float    pend_freq[PEND_MAX];
+typedef struct { uint8_t n; float f[3]; } chord_t;
+static volatile chord_t  pend[PEND_MAX];
 static volatile uint32_t pend_w = 0, pend_r = 0;
 
-static inline void pluck_push(float f)
+static inline void chord_push(int n, const float *f)
 {
-    uint32_t n = (pend_w + 1) & (PEND_MAX - 1);
-    if (n != pend_r) { pend_freq[pend_w] = f; pend_w = n; }
+    uint32_t nx = (pend_w + 1) & (PEND_MAX - 1);
+    if (nx == pend_r) return;
+    pend[pend_w].n = (uint8_t)n;
+    for (int i = 0; i < n; i++) pend[pend_w].f[i] = f[i];
+    pend_w = nx;
 }
 
-/* shared params */
-static volatile float g_cutoff    = 0.50f;  /* damping LPF coef (bottom-half X) */
-static volatile float g_feedback  = 0.97f;  /* loop gain / sustain (bottom-half Y) */
-static volatile int   g_finger_top = 0;     /* finger currently in the pitch zone */
-static volatile int   g_touch_x   = -1;
-static volatile int   g_touch_y   = -1;
+/* shared params (editable in the menu) */
+static volatile float g_cutoff     = 0.55f;  /* damping LPF coef -> "Brightness" */
+static volatile float g_feedback   = 0.985f; /* loop gain        -> "Sustain"    */
+static volatile float g_excite     = 0.45f;  /* mic drive        -> "Mic Drive"  */
+static volatile float g_pluck      = 0.35f;  /* pluck attack amt -> "Pluck" (0 = mic only) */
+static volatile float g_volume     = 90.0f;  /* codec out vol    -> "Volume"     */
+static volatile int   g_finger_down = 0;     /* finger playing -> mic excites held voices */
+static volatile int   g_touch_x    = -1;
+static volatile int   g_touch_y    = -1;
 
-#define EXCITE 0.40f                /* how hard the mic drives the held voice */
-#define DRY    0.12f                /* a little dry mic so input is always audible */
+#define DRY    0.10f
 
-/* ---- scale / note quantisation (top half) ---- */
-#define ROOT_MIDI   48              /* C3 */
-#define OCTAVES     3
-static const int8_t SCALE[]  = { 0, 2, 4, 7, 9 };   /* major pentatonic */
-#define SCALE_LEN   (int)(sizeof(SCALE) / sizeof(SCALE[0]))
-#define NUM_NOTES   (SCALE_LEN * OCTAVES)            /* 15 zones across the top */
-static volatile int g_active_note = -1;             /* highlighted zone while playing, else -1 */
+/* ---- output FX: delay + flanger (page 2) ---- */
+static volatile float g_dly_time = 250.0f;  /* ms */
+static volatile float g_dly_fb   = 0.35f;   /* 0..0.9 */
+static volatile float g_dly_mix  = 0.0f;    /* 0..1 (0 = off) */
+static volatile float g_flg_amt  = 0.0f;    /* 0..1 flanger depth+mix (0 = off) */
 
-static inline float note_freq(int idx)
-{
-    int oct = idx / SCALE_LEN;
-    int deg = idx % SCALE_LEN;
-    int midi = ROOT_MIDI + oct * 12 + SCALE[deg];
-    return 440.0f * powf(2.0f, (float)(midi - 69) / 12.0f);
-}
+#define DLY_MAX 16000               /* 1.0 s @ 16 kHz */
+#define FLG_MAX 512                 /* ~32 ms */
+static float dly_buf[DLY_MAX];
+static int   dly_w = 0;
+static float flg_buf[FLG_MAX];
+static int   flg_w = 0;
+static float flg_phase = 0.0f;
 
-static int steal_voice(void)        /* pick the most-decayed voice */
+/* ---- play modes ---- */
+enum { MODE_TONNETZ, MODE_CHORD, MODE_XY, N_MODES };
+static const char *MODE_NAMES[] = { "Tonnetz", "Chords", "Keys+Spectrum" };
+static volatile int g_mode = MODE_TONNETZ;
+
+static int steal_voice(void)
 {
     int best = 0;
     float lo = V[0].energy;
@@ -104,12 +132,6 @@ static int steal_voice(void)        /* pick the most-decayed voice */
 /* ============================ audio engine ============================ */
 static void audio_engine_task(void *arg)
 {
-    if (dsps_fft2r_init_fc32(NULL, CONFIG_DSP_MAX_FFT_SIZE) != ESP_OK) {
-        ESP_LOGE(TAG, "FFT init failed");
-        vTaskDelete(NULL);
-    }
-    dsps_wind_hann_f32(wind, N_SAMPLES);
-
     if (bsp_extra_codec_init() != ESP_OK) {
         ESP_LOGE(TAG, "Audio codec init failed");
         vTaskDelete(NULL);
@@ -117,10 +139,14 @@ static void audio_engine_task(void *arg)
     int vset = 0;
     bsp_extra_codec_volume_set(90, &vset);
 
+    dsps_fft2r_init_fc32(NULL, CONFIG_DSP_MAX_FFT_SIZE);
+    dsps_wind_hann_f32(wind, N_SAMPLES);
+
     memset(V, 0, sizeof(V));
     for (int i = 0; i < NUM_VOICES; i++) { V[i].freq = 220.0f; V[i].delay = SAMPLE_RATE / 220.0f; }
-    int held = -1;
-    ESP_LOGI(TAG, "Polyphonic Karplus-Strong ready (%d voices)", NUM_VOICES);
+    int  held[3] = { -1, -1, -1 };
+    int  n_held = 0;
+    ESP_LOGI(TAG, "Polyphonic Karplus-Strong + Tonnetz ready (%d voices)", NUM_VOICES);
 
     size_t br = 0, bw = 0;
     while (1) {
@@ -128,27 +154,52 @@ static void audio_engine_task(void *arg)
             continue;
         }
 
-        /* allocate any queued plucks to voices */
+        /* drain queued chords -> allocate voices, remember them as the held set */
         while (pend_r != pend_w) {
-            float f = pend_freq[pend_r];
+            chord_t c = { pend[pend_r].n, { pend[pend_r].f[0], pend[pend_r].f[1], pend[pend_r].f[2] } };
             pend_r = (pend_r + 1) & (PEND_MAX - 1);
-            int v = steal_voice();
-            float d = (float)SAMPLE_RATE / f;
-            if (d < 2.0f) d = 2.0f; else if (d > (KS_MAX - 2)) d = KS_MAX - 2;
-            V[v].freq = f;
-            V[v].delay = d;
-            V[v].pluck_n = (int)d;
-            V[v].energy = 1.0f;     /* mark busy so it isn't immediately stolen */
-            held = v;
+            n_held = c.n;
+            for (int j = 0; j < c.n; j++) {
+                int v = steal_voice();
+                float d = (float)SAMPLE_RATE / c.f[j];
+                if (d < 2.0f) d = 2.0f; else if (d > (KS_MAX - 2)) d = KS_MAX - 2;
+                V[v].freq = c.f[j];
+                V[v].delay = d;
+                V[v].pluck_n = (int)d;
+                V[v].energy = 1.0f;
+                held[j] = v;
+            }
         }
-        bool finger_top = g_finger_top;
-        float g   = g_feedback;
-        float cut = g_cutoff;
+        float g    = g_feedback;
+        float cut  = g_cutoff;
+        float drive = g_excite;
+        float pluck_amp = g_pluck;
+        /* mic transient detector -> impulse excitation (persists across blocks) */
+        static float env_f = 0.0f, env_s = 0.0f, imp_amp = 0.0f;
+        static int   gate_refr = 0, imp_n = 0;
+        float dly_t_ms = g_dly_time;
+        float dly_fb   = g_dly_fb;
+        float dly_mix  = g_dly_mix;
+        float flg_amt  = g_flg_amt;
+        const float flg_inc = 0.35f / SAMPLE_RATE;   /* ~0.35 Hz flanger LFO */
+
+        static int last_vol = -1;
+        int vol = (int)g_volume;
+        if (vol != last_vol) { bsp_extra_codec_volume_set(vol, &vset); last_vol = vol; }
 
         for (int i = 0; i < N_SAMPLES; i++) {
             float l = raw_data[i * CHANNELS]     / 32768.0f;
             float r = raw_data[i * CHANNELS + 1] / 32768.0f;
             float mic = 0.5f * (l + r);
+
+            /* onset detection: fast peak vs slow baseline -> fire a short impulse */
+            float amic = fabsf(mic);
+            env_f = (amic > env_f) ? amic : env_f * 0.55f;
+            env_s += 0.0006f * (amic - env_s);
+            if (gate_refr > 0) gate_refr--;
+            if (gate_refr == 0 && amic > 0.04f && env_f > env_s * 3.5f + 0.03f) {
+                imp_n = 80; imp_amp = drive * 1.3f; gate_refr = 1200;   /* ~75 ms refractory */
+            }
 
             float sum = 0.0f;
             for (int v = 0; v < NUM_VOICES; v++) {
@@ -164,8 +215,10 @@ static void audio_engine_task(void *arg)
                 vc->lp += cut * (d - vc->lp);
 
                 float exc = 0.0f;
-                if (finger_top && v == held) exc += EXCITE * mic;
-                if (vc->pluck_n > 0) { exc += 0.9f * frand(); vc->pluck_n--; }
+                if (vc->pluck_n > 0) { exc += pluck_amp * frand(); vc->pluck_n--; }
+                if (imp_n > 0) {   /* mic-transient impulse excites the held note(s) */
+                    for (int j = 0; j < n_held; j++) if (held[j] == v) { exc += imp_amp * frand(); break; }
+                }
 
                 float nv = exc + g * vc->lp;
                 if (nv > 1.2f) nv = 1.2f; else if (nv < -1.2f) nv = -1.2f;
@@ -177,7 +230,32 @@ static void audio_engine_task(void *arg)
                 sum += o;
             }
 
+            if (imp_n > 0) imp_n--;
+
             float y = sum * 0.6f + DRY * mic;
+
+            /* --- delay FX --- */
+            int dsamp = (int)(dly_t_ms * (SAMPLE_RATE / 1000.0f));
+            if (dsamp < 1) dsamp = 1; else if (dsamp > DLY_MAX - 1) dsamp = DLY_MAX - 1;
+            int dr = dly_w - dsamp; if (dr < 0) dr += DLY_MAX;
+            float dly_out = dly_buf[dr];
+            dly_buf[dly_w] = y + dly_fb * dly_out;
+            dly_w++; if (dly_w >= DLY_MAX) dly_w = 0;
+            y += dly_mix * dly_out;
+
+            /* --- flanger FX (modulated short delay) --- */
+            if (flg_amt > 0.001f) {
+                flg_phase += flg_inc; if (flg_phase >= 1.0f) flg_phase -= 1.0f;
+                float lfo = 0.5f * (1.0f - cosf(6.2831853f * flg_phase)); /* 0..1 */
+                float fd = 2.0f + lfo * 110.0f;                          /* ~0.1..7 ms */
+                float fr = (float)flg_w - fd; while (fr < 0.0f) fr += FLG_MAX;
+                int f0 = (int)fr; float ff = fr - (float)f0; int f1 = f0 + 1; if (f1 >= FLG_MAX) f1 -= FLG_MAX;
+                float fdel = flg_buf[f0] * (1.0f - ff) + flg_buf[f1] * ff;
+                flg_buf[flg_w] = y + 0.5f * flg_amt * fdel;
+                flg_w++; if (flg_w >= FLG_MAX) flg_w = 0;
+                y += flg_amt * fdel;
+            }
+
             if (y > 1.0f) y = 1.0f; else if (y < -1.0f) y = -1.0f;
             int16_t s = (int16_t)(y * 32767.0f);
             out_data[i * CHANNELS]     = s;
@@ -186,25 +264,333 @@ static void audio_engine_task(void *arg)
         }
         bsp_extra_i2s_write(out_data, sizeof(out_data), &bw, portMAX_DELAY);
 
-        /* FFT of the output signal */
-        dsps_mul_f32(audio_buffer, wind, audio_buffer, N_SAMPLES, 1, 1, 1);
-        for (int i = 0; i < N_SAMPLES; i++) {
-            fft_buffer[2 * i]     = audio_buffer[i];
-            fft_buffer[2 * i + 1] = 0;
-        }
-        dsps_fft2r_fc32(fft_buffer, N_SAMPLES);
-        dsps_bit_rev_fc32(fft_buffer, N_SAMPLES);
-        for (int i = 0; i < N_SAMPLES / 2; i++) {
-            float re = fft_buffer[2 * i];
-            float im = fft_buffer[2 * i + 1];
-            float mag = sqrtf(re * re + im * im);
-            spectrum[i] = 20 * log10f(mag / (N_SAMPLES / 2) + 1e-9f);
-        }
-        for (int i = 0; i < STRIPE_COUNT; i++) {
-            int fft_idx = i * (N_SAMPLES / 2) / STRIPE_COUNT;
-            display_spectrum[i] = fmaxf(-90.0f, fminf(0.0f, spectrum[fft_idx]));
+        /* spectrum of the output (only needed by Keys+Spectrum mode) */
+        if (g_mode == MODE_XY) {
+            dsps_mul_f32(audio_buffer, wind, audio_buffer, N_SAMPLES, 1, 1, 1);
+            for (int i = 0; i < N_SAMPLES; i++) { fft_buffer[2 * i] = audio_buffer[i]; fft_buffer[2 * i + 1] = 0; }
+            dsps_fft2r_fc32(fft_buffer, N_SAMPLES);
+            dsps_bit_rev_fc32(fft_buffer, N_SAMPLES);
+            for (int i = 0; i < N_SAMPLES / 2; i++) {
+                float re = fft_buffer[2 * i], im = fft_buffer[2 * i + 1];
+                float mag = sqrtf(re * re + im * im);
+                spectrum[i] = 20 * log10f(mag / (N_SAMPLES / 2) + 1e-9f);
+            }
+            for (int i = 0; i < STRIPE_COUNT; i++) {
+                int fi = i * (N_SAMPLES / 2) / STRIPE_COUNT;
+                display_spectrum[i] = fmaxf(-90.0f, fminf(0.0f, spectrum[fi]));
+            }
         }
     }
+}
+
+/* ============================ Tonnetz hex grid ============================ */
+#define HEX_R       52.0f           /* hex circumradius (centre -> vertex) */
+#define CHORD_R     (HEX_R * 0.72f)  /* generous catch radius around a vertex for chords */
+#define ROOT_MIDI   60              /* C4 at grid centre */
+#define MAX_HEX     64
+#define MAX_VTX     256
+
+typedef struct { float x, y; int note; float freq; } hex_t;
+static hex_t HEX[MAX_HEX];
+static int   n_hex = 0;
+
+/* chord vertices = points where 3 mutually-adjacent hexes meet */
+typedef struct { float x, y; int cnt; int h[3]; } vtx_t;
+static vtx_t VTX[MAX_VTX];
+static int   n_vtx = 0;
+
+static inline float midi_freq(int note)
+{
+    return 440.0f * powf(2.0f, (float)(note - 69) / 12.0f);
+}
+
+static void build_hex_grid(void)
+{
+    const float cx = CANVAS_WIDTH * 0.5f;
+    const float cy = CANVAS_HEIGHT * 0.5f;
+    const float sqrt3 = 1.7320508f;
+    n_hex = 0;
+    for (int r = -3; r <= 3; r++) {
+        for (int q = -3; q <= 3; q++) {
+            float x = cx + HEX_R * sqrt3 * ((float)q + (float)r * 0.5f);
+            float y = cy + HEX_R * 1.5f * (float)r;
+            if (x < HEX_R * 0.6f || x > CANVAS_WIDTH - HEX_R * 0.6f) continue;
+            if (y < HEX_R * 0.6f || y > CANVAS_HEIGHT - NAV_H - HEX_R * 0.4f) continue;
+            if (n_hex >= MAX_HEX) break;
+            int note = ROOT_MIDI + 7 * q + 4 * r;        /* Tonnetz: +5th along q, +maj3rd along r */
+            HEX[n_hex].x = x;
+            HEX[n_hex].y = y;
+            HEX[n_hex].note = note;
+            HEX[n_hex].freq = midi_freq(note);
+            n_hex++;
+        }
+    }
+    ESP_LOGI(TAG, "Tonnetz grid: %d hexes", n_hex);
+}
+
+static inline void hex_vertex(float cx, float cy, int k, float *vx, float *vy)
+{
+    float a = (3.14159265f / 180.0f) * (60.0f * (float)k - 30.0f);
+    *vx = cx + HEX_R * cosf(a);
+    *vy = cy + HEX_R * sinf(a);
+}
+
+static void draw_hex_outline(lv_layer_t *layer, float cx, float cy, lv_color_t col, lv_opa_t opa, int width)
+{
+    lv_draw_line_dsc_t ld;
+    lv_draw_line_dsc_init(&ld);
+    ld.color = col;
+    ld.opa = opa;
+    ld.width = width;
+    float vx[6], vy[6];
+    for (int k = 0; k < 6; k++) hex_vertex(cx, cy, k, &vx[k], &vy[k]);
+    for (int k = 0; k < 6; k++) {
+        int n = (k + 1) % 6;
+        ld.p1.x = vx[k]; ld.p1.y = vy[k];
+        ld.p2.x = vx[n]; ld.p2.y = vy[n];
+        lv_draw_line(layer, &ld);
+    }
+}
+
+static void fill_hex(lv_layer_t *layer, float cx, float cy, lv_color_t col, lv_opa_t opa)
+{
+    float vx[6], vy[6];
+    for (int k = 0; k < 6; k++) hex_vertex(cx, cy, k, &vx[k], &vy[k]);
+    lv_draw_triangle_dsc_t td;
+    lv_draw_triangle_dsc_init(&td);
+    td.color = col;
+    td.opa = opa;
+    for (int k = 0; k < 6; k++) {
+        int n = (k + 1) % 6;
+        td.p[0].x = cx;    td.p[0].y = cy;
+        td.p[1].x = vx[k]; td.p[1].y = vy[k];
+        td.p[2].x = vx[n]; td.p[2].y = vy[n];
+        lv_draw_triangle(layer, &td);
+    }
+}
+
+/* draw a hexagon of arbitrary radius (for chord-zone markers) */
+static void draw_hexR(lv_layer_t *layer, float cx, float cy, float R,
+                      bool fill, lv_color_t fcol, lv_opa_t fopa,
+                      lv_color_t bcol, int bw)
+{
+    float vx[6], vy[6];
+    for (int k = 0; k < 6; k++) {
+        float a = (3.14159265f / 180.0f) * (60.0f * (float)k - 30.0f);
+        vx[k] = cx + R * cosf(a);
+        vy[k] = cy + R * sinf(a);
+    }
+    if (fill) {
+        lv_draw_triangle_dsc_t td;
+        lv_draw_triangle_dsc_init(&td);
+        td.color = fcol; td.opa = fopa;
+        for (int k = 0; k < 6; k++) {
+            int n = (k + 1) % 6;
+            td.p[0].x = cx;    td.p[0].y = cy;
+            td.p[1].x = vx[k]; td.p[1].y = vy[k];
+            td.p[2].x = vx[n]; td.p[2].y = vy[n];
+            lv_draw_triangle(layer, &td);
+        }
+    }
+    lv_draw_line_dsc_t ld;
+    lv_draw_line_dsc_init(&ld);
+    ld.color = bcol; ld.opa = LV_OPA_COVER; ld.width = bw;
+    for (int k = 0; k < 6; k++) {
+        int n = (k + 1) % 6;
+        ld.p1.x = vx[k]; ld.p1.y = vy[k];
+        ld.p2.x = vx[n]; ld.p2.y = vy[n];
+        lv_draw_line(layer, &ld);
+    }
+}
+
+static void build_vertices(void)
+{
+    n_vtx = 0;
+    for (int i = 0; i < n_hex; i++) {
+        for (int k = 0; k < 6; k++) {
+            float vx, vy;
+            hex_vertex(HEX[i].x, HEX[i].y, k, &vx, &vy);
+            int found = -1;
+            for (int j = 0; j < n_vtx; j++) {
+                float dx = VTX[j].x - vx, dy = VTX[j].y - vy;
+                if (dx * dx + dy * dy < 81.0f) { found = j; break; }   /* within ~9 px */
+            }
+            if (found >= 0) {
+                if (VTX[found].cnt < 3) VTX[found].h[VTX[found].cnt] = i;
+                VTX[found].cnt++;
+            } else if (n_vtx < MAX_VTX) {
+                VTX[n_vtx].x = vx; VTX[n_vtx].y = vy; VTX[n_vtx].cnt = 1; VTX[n_vtx].h[0] = i; n_vtx++;
+            }
+        }
+    }
+    int m = 0;
+    for (int j = 0; j < n_vtx; j++) if (VTX[j].cnt >= 3) VTX[m++] = VTX[j];   /* interior vertices only */
+    n_vtx = m;
+    ESP_LOGI(TAG, "chord vertices: %d", n_vtx);
+}
+
+/* ============================ params menu ============================ */
+typedef struct { const char *name; volatile float *val; float lo, hi; bool as_pct; } param_t;
+static param_t PAGE_RES[] = {
+    { "Brightness", &g_cutoff,   0.05f, 0.95f,  true  },
+    { "Sustain",    &g_feedback, 0.90f, 0.999f, true  },
+    { "Mic Drive",  &g_excite,   0.00f, 1.00f,  true  },
+    { "Pluck",      &g_pluck,    0.00f, 1.00f,  true  },
+    { "Volume",     &g_volume,   0.00f, 100.0f, false },
+};
+static param_t PAGE_FX[] = {
+    { "Delay Time", &g_dly_time, 20.0f, 1000.0f, false },
+    { "Delay Fbk",  &g_dly_fb,   0.00f, 0.90f,   true  },
+    { "Delay Mix",  &g_dly_mix,  0.00f, 1.00f,   true  },
+    { "Flanger",    &g_flg_amt,  0.00f, 1.00f,   true  },
+};
+typedef struct { const char *title; param_t *p; int n; } page_t;
+static page_t PAGES[] = {
+    { "MODE",      NULL,     0 },   /* special: mode selector */
+    { "RESONATOR", PAGE_RES, 5 },
+    { "FX",        PAGE_FX,  4 },
+};
+#define N_PAGES (int)(sizeof(PAGES) / sizeof(PAGES[0]))
+static bool g_menu_open = false;
+static int  g_menu_page = 0;
+
+#define MENU_TOP    72
+#define MENU_ROW_H  76
+#define MENU_MARGIN 56
+
+static void menu_row_bounds(int i, int *y0, int *y1)   /* full touch row */
+{
+    *y0 = MENU_TOP + i * MENU_ROW_H;
+    *y1 = *y0 + MENU_ROW_H - 12;
+}
+
+static void draw_menu(lv_layer_t *layer, int page, int editing_row)
+{
+    page_t *pg = &PAGES[page];
+
+    lv_draw_rect_dsc_t bg;
+    lv_draw_rect_dsc_init(&bg);
+    bg.bg_color = lv_color_hex(0x0a0a12);
+    bg.bg_opa = LV_OPA_COVER;
+    lv_area_t full = { 0, 0, CANVAS_WIDTH - 1, CANVAS_HEIGHT - 1 };
+    lv_draw_rect(layer, &bg, &full);
+
+    /* title (swipe the title area left/right for pages, down to close) */
+    lv_draw_label_dsc_t ld;
+    lv_draw_label_dsc_init(&ld);
+    ld.font = &lv_font_montserrat_24;
+    ld.color = lv_color_white();
+    ld.align = LV_TEXT_ALIGN_CENTER;
+    /* static: lv_draw_label keeps the text pointer until the layer is flushed */
+    static char tbuf[40];
+    snprintf(tbuf, sizeof(tbuf), "%s   %s   %s", page > 0 ? "<" : " ", pg->title, page < N_PAGES - 1 ? ">" : " ");
+    ld.text = tbuf;
+    lv_area_t title = { 0, 18, CANVAS_WIDTH - 1, 50 };
+    lv_draw_label(layer, &ld, &title);
+
+    /* page dots */
+    for (int p = 0; p < N_PAGES; p++) {
+        lv_draw_rect_dsc_t dot;
+        lv_draw_rect_dsc_init(&dot);
+        dot.bg_color = (p == page) ? lv_color_white() : lv_color_hex(0x404850);
+        dot.bg_opa = LV_OPA_COVER;
+        dot.radius = LV_RADIUS_CIRCLE;
+        int cx = CANVAS_WIDTH / 2 - (N_PAGES * 14) / 2 + p * 14;
+        lv_area_t da = { cx, 56, cx + 7, 63 };
+        lv_draw_rect(layer, &dot, &da);
+    }
+
+    if (pg->p == NULL) {
+        /* ---- MODE selector ---- */
+        for (int m = 0; m < N_MODES; m++) {
+            int y0, y1; menu_row_bounds(m, &y0, &y1);
+            bool sel = (m == g_mode);
+            lv_draw_rect_dsc_t tr;
+            lv_draw_rect_dsc_init(&tr);
+            tr.bg_color = sel ? lv_color_hex(0x224058) : lv_color_hex(0x181c24);
+            tr.bg_opa = LV_OPA_COVER;
+            tr.radius = 10;
+            tr.border_color = sel ? lv_color_white() : lv_color_hex(0x303840);
+            tr.border_width = sel ? 3 : 1;
+            lv_area_t row = { MENU_MARGIN, y0, CANVAS_WIDTH - MENU_MARGIN, y0 + 54 };
+            lv_draw_rect(layer, &tr, &row);
+
+            static char mbuf[6][20];
+            int mi = (m < 6) ? m : 5;
+            snprintf(mbuf[mi], sizeof(mbuf[mi]), "%s%s", sel ? "> " : "", MODE_NAMES[m]);
+            ld.font = &lv_font_montserrat_24;
+            ld.color = sel ? lv_color_white() : lv_color_hex(0xc0c8d0);
+            ld.align = LV_TEXT_ALIGN_CENTER;
+            ld.text = mbuf[mi];
+            lv_area_t la = { MENU_MARGIN, y0 + 12, CANVAS_WIDTH - MENU_MARGIN, y0 + 46 };
+            lv_draw_label(layer, &ld, &la);
+        }
+        ld.font = &lv_font_montserrat_20;
+        ld.color = lv_color_hex(0x808890);
+        ld.align = LV_TEXT_ALIGN_CENTER;
+        ld.text = "title: < > pages   v close";
+        lv_area_t hint2 = { 0, CANVAS_HEIGHT - 38, CANVAS_WIDTH - 1, CANVAS_HEIGHT - 14 };
+        lv_draw_label(layer, &ld, &hint2);
+        return;
+    }
+
+    for (int i = 0; i < pg->n; i++) {
+        int y0, y1;
+        menu_row_bounds(i, &y0, &y1);
+        float v = *pg->p[i].val;
+        float t = (v - pg->p[i].lo) / (pg->p[i].hi - pg->p[i].lo);
+        if (t < 0) t = 0; else if (t > 1) t = 1;
+        bool sel = (i == editing_row);
+
+        /* name (own line, white on dark = always legible) + value on the right.
+         * Per-row STATIC buffers: lv_draw_label only stores the pointer and renders
+         * at finish_layer, so reusing one local buffer would show the last row's text. */
+        static char nmbuf[8][24];
+        static char vbuf[8][16];
+        int bi = (i < 8) ? i : 7;
+        snprintf(nmbuf[bi], sizeof(nmbuf[bi]), "%s", pg->p[i].name);
+        if (pg->p[i].as_pct) snprintf(vbuf[bi], sizeof(vbuf[bi]), "%d%%", (int)(t * 100.0f + 0.5f));
+        else                 snprintf(vbuf[bi], sizeof(vbuf[bi]), "%d", (int)v);
+        ld.font = &lv_font_montserrat_20;
+        ld.color = sel ? lv_color_white() : lv_color_hex(0xc0c8d0);
+        ld.align = LV_TEXT_ALIGN_LEFT;
+        ld.text = nmbuf[bi];
+        lv_area_t na = { MENU_MARGIN, y0, CANVAS_WIDTH - MENU_MARGIN, y0 + 24 };
+        lv_draw_label(layer, &ld, &na);
+        ld.align = LV_TEXT_ALIGN_RIGHT;
+        ld.text = vbuf[bi];
+        lv_draw_label(layer, &ld, &na);
+
+        /* bar */
+        int by0 = y0 + 30, by1 = y0 + 56;
+        lv_draw_rect_dsc_t tr;
+        lv_draw_rect_dsc_init(&tr);
+        tr.bg_color = lv_color_hex(0x181c24);
+        tr.bg_opa = LV_OPA_COVER;
+        tr.radius = 6;
+        tr.border_color = sel ? lv_color_white() : lv_color_hex(0x303840);
+        tr.border_width = sel ? 3 : 1;
+        lv_area_t track = { MENU_MARGIN, by0, CANVAS_WIDTH - MENU_MARGIN, by1 };
+        lv_draw_rect(layer, &tr, &track);
+
+        int fill_w = (int)((CANVAS_WIDTH - 2 * MENU_MARGIN) * t);
+        if (fill_w > 2) {
+            lv_draw_rect_dsc_t fl;
+            lv_draw_rect_dsc_init(&fl);
+            fl.bg_color = lv_color_hsv_to_rgb(190, 75, sel ? 100 : 75);
+            fl.bg_opa = LV_OPA_COVER;
+            fl.radius = 6;
+            lv_area_t fa = { MENU_MARGIN, by0, MENU_MARGIN + fill_w, by1 };
+            lv_draw_rect(layer, &fl, &fa);
+        }
+    }
+
+    ld.font = &lv_font_montserrat_20;
+    ld.color = lv_color_hex(0x808890);
+    ld.align = LV_TEXT_ALIGN_CENTER;
+    ld.text = "title: < > pages   v close";
+    lv_area_t hint = { 0, CANVAS_HEIGHT - 38, CANVAS_WIDTH - 1, CANVAS_HEIGHT - 14 };
+    lv_draw_label(layer, &ld, &hint);
 }
 
 /* ============================ display + touch ============================ */
@@ -215,134 +601,233 @@ static void timer_cb(lv_timer_t *timer)
     lv_canvas_init_layer(canvas, &layer);
     lv_canvas_fill_bg(canvas, lv_color_black(), LV_OPA_COVER);
 
-    const int center_y = CANVAS_HEIGHT / 2;
-
-    /* ---- poll the touchscreen and map to synth params ---- */
+    static int  prev_sig = -1;
     static bool prev_pressed = false;
-    static bool prev_top = false;
+    static int  start_x = 0, start_y = 0;
+    static bool gesture_consumed = false;
+    static int  editing_row = -1;
+    int  active[3];
+    int  n_active = 0;
+    float chord_cx = 0, chord_cy = 0;
+
+    /* ---- read touch ---- */
     lv_indev_t *indev = bsp_display_get_input_dev();
-    bool pressed = false;
-    bool in_top = false;
-    if (indev && lv_indev_get_state(indev) == LV_INDEV_STATE_PRESSED) {
+    bool pressed = (indev && lv_indev_get_state(indev) == LV_INDEV_STATE_PRESSED);
+    int tx = -1, ty = -1;
+    if (pressed) {
         lv_point_t p;
         lv_indev_get_point(indev, &p);
-        int x = p.x, y = p.y;
-        if (x < 0) x = 0; else if (x >= CANVAS_WIDTH)  x = CANVAS_WIDTH - 1;
-        if (y < 0) y = 0; else if (y >= CANVAS_HEIGHT) y = CANVAS_HEIGHT - 1;
-        g_touch_x = x;
-        g_touch_y = y;
-        pressed = true;
-        float tx = (float)x / CANVAS_WIDTH;   /* 0..1 */
+        tx = p.x; ty = p.y;
+        if (tx < 0) tx = 0; else if (tx >= CANVAS_WIDTH)  tx = CANVAS_WIDTH - 1;
+        if (ty < 0) ty = 0; else if (ty >= CANVAS_HEIGHT) ty = CANVAS_HEIGHT - 1;
+    }
 
-        if (y < center_y) {
-            /* TOP: scale-quantised pitch (pentatonic, 3 octaves) + pluck per note */
-            in_top = true;
-            int idx = (int)(tx * NUM_NOTES);
-            if (idx < 0) idx = 0; else if (idx >= NUM_NOTES) idx = NUM_NOTES - 1;
-            if (!prev_pressed || !prev_top || idx != g_active_note) {
-                pluck_push(note_freq(idx));   /* fresh touch or new note zone -> pluck a voice */
+    /* ---- gestures: open = swipe up from bottom; in menu = swipe title strip (< > pages, v close) ---- */
+    if (pressed && !prev_pressed) { start_x = tx; start_y = ty; gesture_consumed = false; }
+    if (pressed && !gesture_consumed) {
+        int dx = tx - start_x, dy = ty - start_y;
+        int adx = dx < 0 ? -dx : dx;
+        int ady = dy < 0 ? -dy : dy;
+        if (!g_menu_open) {
+            if (start_y >= CANVAS_HEIGHT - NAV_H && dy <= -SWIPE_THRESH) {
+                g_menu_open = true; gesture_consumed = true; g_finger_down = 0; prev_sig = -1;
             }
-            g_active_note = idx;
+        } else if (start_y < MENU_TOP) {              /* gestures only from the title strip */
+            if (ady >= SWIPE_THRESH && ady > adx && dy > 0) {
+                g_menu_open = false; gesture_consumed = true; editing_row = -1;
+            } else if (adx >= SWIPE_THRESH && adx > ady) {
+                if (dx < 0 && g_menu_page < N_PAGES - 1) g_menu_page++;
+                else if (dx > 0 && g_menu_page > 0)      g_menu_page--;
+                gesture_consumed = true; editing_row = -1;
+            }
+        }
+    }
+
+    /* ---- MENU mode ---- */
+    if (g_menu_open) {
+        g_finger_down = 0;
+        g_touch_x = -1;
+        page_t *pg = &PAGES[g_menu_page];
+        if (pressed && !gesture_consumed && ty >= MENU_TOP) {
+            if (pg->p == NULL) {
+                for (int m = 0; m < N_MODES; m++) {
+                    int y0, y1; menu_row_bounds(m, &y0, &y1);
+                    if (ty >= y0 - 6 && ty <= y0 + 54 + 6) { g_mode = m; break; }
+                }
+            } else {
+                for (int i = 0; i < pg->n; i++) {
+                    int y0, y1; menu_row_bounds(i, &y0, &y1);
+                    if (ty >= y0 - 6 && ty <= y1 + 6) {
+                        float t = (float)(tx - MENU_MARGIN) / (float)(CANVAS_WIDTH - 2 * MENU_MARGIN);
+                        if (t < 0) t = 0; else if (t > 1) t = 1;
+                        *pg->p[i].val = pg->p[i].lo + t * (pg->p[i].hi - pg->p[i].lo);
+                        editing_row = i;
+                        break;
+                    }
+                }
+            }
+        }
+        draw_menu(&layer, g_menu_page, editing_row);
+        prev_pressed = pressed;
+        lv_canvas_finish_layer(canvas, &layer);
+        return;
+    }
+
+    /* ---- PLAY mode ---- */
+    bool play_touch = pressed && !gesture_consumed && ty < CANVAS_HEIGHT - NAV_H;
+    if (play_touch && g_mode == MODE_XY) {
+        /* Keys+Spectrum: top half = scale note (pentatonic, 3 oct), bottom half = filter */
+        g_touch_x = tx; g_touch_y = ty;
+        const int cy = CANVAS_HEIGHT / 2;
+        float txn = (float)tx / CANVAS_WIDTH;
+        if (txn < 0) txn = 0; else if (txn > 1) txn = 1;
+        if (ty < cy) {
+            int idx = (int)(txn * XY_NOTES);
+            if (idx < 0) idx = 0; else if (idx >= XY_NOTES) idx = XY_NOTES - 1;
+            if (idx != g_active_note) { float f = xy_note_freq(idx); chord_push(1, &f); g_active_note = idx; }
         } else {
-            /* BOTTOM: filter. X = brightness, Y = sustain */
-            float by = (float)(y - center_y) / (float)(CANVAS_HEIGHT - center_y); /* 0..1 */
-            g_cutoff   = 0.05f + tx * 0.90f;
-            g_feedback = 0.90f + by * 0.099f;   /* 0.90 .. 0.999 */
+            float by = (float)(ty - cy) / (float)(CANVAS_HEIGHT - NAV_H - cy);
+            if (by < 0) by = 0; else if (by > 1) by = 1;
+            g_cutoff   = 0.05f + txn * 0.90f;
+            g_feedback = 0.90f + by * 0.099f;
             g_active_note = -1;
         }
+        g_finger_down = 1;
+    } else if (play_touch && (n_hex > 0 || n_vtx > 0)) {
+        g_touch_x = tx;
+        g_touch_y = ty;
+
+        /* nearest hex */
+        int hi = -1; float hd = 1e18f;
+        for (int i = 0; i < n_hex; i++) {
+            float dx = (float)tx - HEX[i].x, dy = (float)ty - HEX[i].y;
+            float dd = dx * dx + dy * dy;
+            if (dd < hd) { hd = dd; hi = i; }
+        }
+        /* nearest chord vertex */
+        int vi = -1; float vd = 1e18f;
+        for (int i = 0; i < n_vtx; i++) {
+            float dx = (float)tx - VTX[i].x, dy = (float)ty - VTX[i].y;
+            float dd = dx * dx + dy * dy;
+            if (dd < vd) { vd = dd; vi = i; }
+        }
+
+        bool do_chord = (g_mode == MODE_CHORD) && (vi >= 0);   /* Tonnetz = single notes only */
+
+        if (do_chord && vi >= 0) {
+            active[0] = VTX[vi].h[0]; active[1] = VTX[vi].h[1]; active[2] = VTX[vi].h[2];
+            n_active = 3;
+            chord_cx = VTX[vi].x; chord_cy = VTX[vi].y;
+        } else if (hi >= 0) {
+            active[0] = hi; n_active = 1;
+        }
+
+        int sig = 0;
+        for (int j = 0; j < n_active; j++) sig = sig * 131 + (active[j] + 1);
+        sig = sig * 4 + n_active;
+        if (sig != prev_sig && n_active > 0) {
+            float f[3];
+            for (int j = 0; j < n_active; j++) f[j] = HEX[active[j]].freq;
+            chord_push(n_active, f);
+            prev_sig = sig;
+        }
+        g_finger_down = 1;
     } else {
         g_touch_x = -1;
         g_touch_y = -1;
+        g_finger_down = 0;
+        prev_sig = -1;
         g_active_note = -1;
     }
-    g_finger_top = in_top ? 1 : 0;
     prev_pressed = pressed;
-    prev_top = in_top;
 
-    /* ---- highlight the active note zone (drawn under the bars) ---- */
-    if (g_active_note >= 0) {
-        int x0 = g_active_note * CANVAS_WIDTH / NUM_NOTES;
-        int x1 = (g_active_note + 1) * CANVAS_WIDTH / NUM_NOTES;
-        lv_draw_rect_dsc_t zb;
-        lv_draw_rect_dsc_init(&zb);
-        zb.bg_color = lv_color_white();
-        zb.bg_opa = LV_OPA_20;
-        lv_area_t za = { x0, 0, x1 - 1, center_y - 1 };
-        lv_draw_rect(&layer, &zb, &za);
-    }
+    if (g_mode == MODE_XY) {
+        /* ---- KEYS+SPECTRUM: output spectrum + pentatonic note strip ---- */
+        const int cy = CANVAS_HEIGHT / 2;
+        const int stripe_w = CANVAS_WIDTH / STRIPE_COUNT;
 
-    /* ---- spectrum bars (output signal) ---- */
-    const int stripe_width = CANVAS_WIDTH / STRIPE_COUNT;
-    const int bar_gap_px = 2;
-
-    for (int i = 0; i < STRIPE_COUNT; i++) {
-        float db = display_spectrum[i];
-        float db_min = -90.0f, db_max = 0.0f;
-        float norm = (db - db_min) / (db_max - db_min);
-        norm = fmaxf(0.0f, fminf(1.0f, norm));
-        norm = sqrtf(norm);
-
-        int bar_height = (int)(norm * (CANVAS_HEIGHT / 2));
-
-        if (peak[i] < bar_height) {
-            peak[i] = bar_height;
-        } else {
-            peak[i] -= 2;
-            if (peak[i] < 0) peak[i] = 0;
+        if (g_active_note >= 0) {
+            int x0 = g_active_note * CANVAS_WIDTH / XY_NOTES;
+            int x1 = (g_active_note + 1) * CANVAS_WIDTH / XY_NOTES;
+            lv_draw_rect_dsc_t zb; lv_draw_rect_dsc_init(&zb);
+            zb.bg_color = lv_color_white(); zb.bg_opa = LV_OPA_20;
+            lv_area_t za = { x0, 0, x1 - 1, cy - 1 };
+            lv_draw_rect(&layer, &zb, &za);
         }
-
-        float hue_step = 270.0f / STRIPE_COUNT;
-        uint16_t hue = (uint16_t)(i * hue_step);
-        lv_color_t color = lv_color_hsv_to_rgb(hue, 100, 100);
-
-        lv_draw_rect_dsc_t rect_dsc;
-        lv_draw_rect_dsc_init(&rect_dsc);
-        rect_dsc.bg_color = color;
-        rect_dsc.bg_opa = LV_OPA_COVER;
-
-        int x_start = i * stripe_width + bar_gap_px / 2;
-        int x_end   = (i + 1) * stripe_width - bar_gap_px / 2 - 1;
-
-        lv_area_t bar_area = { x_start, center_y - bar_height, x_end, center_y + bar_height };
-        lv_draw_rect(&layer, &rect_dsc, &bar_area);
-
-        int peak_y_top = center_y - (int)peak[i] - 2;
-        int peak_y_bot = center_y + (int)peak[i];
-        lv_area_t particle_area_top = { x_start, peak_y_top, x_end, peak_y_top + 2 };
-        lv_draw_rect(&layer, &rect_dsc, &particle_area_top);
-        lv_area_t particle_area_bot = { x_start, peak_y_bot, x_end, peak_y_bot + 2 };
-        lv_draw_rect(&layer, &rect_dsc, &particle_area_bot);
+        for (int i = 0; i < STRIPE_COUNT; i++) {
+            float norm = (display_spectrum[i] + 90.0f) / 90.0f;
+            norm = fmaxf(0.0f, fminf(1.0f, norm)); norm = sqrtf(norm);
+            int bh = (int)(norm * (CANVAS_HEIGHT / 2));
+            if (peak[i] < bh) peak[i] = bh; else { peak[i] -= 2; if (peak[i] < 0) peak[i] = 0; }
+            uint16_t hue = (uint16_t)(i * (270.0f / STRIPE_COUNT));
+            lv_draw_rect_dsc_t rd; lv_draw_rect_dsc_init(&rd);
+            rd.bg_color = lv_color_hsv_to_rgb(hue, 100, 100); rd.bg_opa = LV_OPA_COVER;
+            int xs = i * stripe_w + 1, xe = (i + 1) * stripe_w - 2;
+            lv_area_t ba = { xs, cy - bh, xe, cy + bh }; lv_draw_rect(&layer, &rd, &ba);
+            lv_area_t pt = { xs, cy - (int)peak[i] - 2, xe, cy - (int)peak[i] }; lv_draw_rect(&layer, &rd, &pt);
+            lv_area_t pb = { xs, cy + (int)peak[i], xe, cy + (int)peak[i] + 2 }; lv_draw_rect(&layer, &rd, &pb);
+        }
+        for (int k = 0; k <= XY_NOTES; k++) {
+            int x = k * CANVAS_WIDTH / XY_NOTES; if (x >= CANVAS_WIDTH) x = CANVAS_WIDTH - 1;
+            bool oct = (k % SCALE_LEN) == 0;
+            lv_draw_rect_dsc_t tl; lv_draw_rect_dsc_init(&tl);
+            tl.bg_color = lv_color_hex(oct ? 0x909090 : 0x383838); tl.bg_opa = oct ? LV_OPA_70 : LV_OPA_40;
+            lv_area_t la = { x, 0, x + (oct ? 1 : 0), cy - 1 }; lv_draw_rect(&layer, &tl, &la);
+        }
+        lv_draw_rect_dsc_t ln; lv_draw_rect_dsc_init(&ln);
+        ln.bg_color = lv_color_hex(0x404040); ln.bg_opa = LV_OPA_50;
+        lv_area_t dv = { 0, cy - 1, CANVAS_WIDTH - 1, cy }; lv_draw_rect(&layer, &ln, &dv);
+    } else {
+        /* ---- TONNETZ / CHORD: the note grid, with played notes lit ---- */
+        for (int i = 0; i < n_hex; i++) {
+            draw_hex_outline(&layer, HEX[i].x, HEX[i].y, lv_color_hex(0x303840), LV_OPA_COVER, 2);
+            uint16_t hue = (uint16_t)((HEX[i].note % 12) * 30);
+            lv_draw_rect_dsc_t dot;
+            lv_draw_rect_dsc_init(&dot);
+            dot.bg_color = lv_color_hsv_to_rgb(hue, 70, 80);
+            dot.bg_opa = LV_OPA_COVER;
+            dot.radius = LV_RADIUS_CIRCLE;
+            const int rr = 7;
+            lv_area_t da = { (int)HEX[i].x - rr, (int)HEX[i].y - rr, (int)HEX[i].x + rr, (int)HEX[i].y + rr };
+            lv_draw_rect(&layer, &dot, &da);
+        }
+        if (g_mode == MODE_CHORD) {
+            /* faint hexagon overlays mark where the chords live */
+            for (int i = 0; i < n_vtx; i++) {
+                draw_hexR(&layer, VTX[i].x, VTX[i].y, CHORD_R * 0.9f,
+                          false, lv_color_black(), LV_OPA_TRANSP, lv_color_hex(0x4a5560), 2);
+            }
+        }
+        for (int j = 0; j < n_active; j++) {
+            hex_t *h = &HEX[active[j]];
+            uint16_t hue = (uint16_t)((h->note % 12) * 30);
+            fill_hex(&layer, h->x, h->y, lv_color_hsv_to_rgb(hue, 90, 100), LV_OPA_60);
+            draw_hex_outline(&layer, h->x, h->y, lv_color_white(), LV_OPA_COVER, 3);
+        }
     }
 
-    /* ---- note-zone boundaries on the top half (octave lines brighter) ---- */
-    for (int k = 0; k <= NUM_NOTES; k++) {
-        int x = k * CANVAS_WIDTH / NUM_NOTES;
-        if (x >= CANVAS_WIDTH) x = CANVAS_WIDTH - 1;
-        bool octave = (k % SCALE_LEN) == 0;
-        lv_draw_rect_dsc_t tl;
-        lv_draw_rect_dsc_init(&tl);
-        tl.bg_color = lv_color_hex(octave ? 0x909090 : 0x383838);
-        tl.bg_opa = octave ? LV_OPA_70 : LV_OPA_40;
-        lv_area_t la = { x, 0, x + (octave ? 1 : 0), center_y - 1 };
-        lv_draw_rect(&layer, &tl, &la);
+    /* ---- bottom handle bar (swipe up here for the menu) ---- */
+    {
+        lv_draw_rect_dsc_t hb;
+        lv_draw_rect_dsc_init(&hb);
+        hb.bg_color = lv_color_hex(0x808890);
+        hb.bg_opa = LV_OPA_60;
+        hb.radius = LV_RADIUS_CIRCLE;
+        const int bw = 120, bh = 6;
+        int bx = (CANVAS_WIDTH - bw) / 2;
+        int by = CANVAS_HEIGHT - NAV_H / 2 - bh / 2;
+        lv_area_t ba = { bx, by, bx + bw, by + bh };
+        lv_draw_rect(&layer, &hb, &ba);
     }
-
-    /* ---- center divider (top = pitch, bottom = filter) ---- */
-    lv_draw_rect_dsc_t line_dsc;
-    lv_draw_rect_dsc_init(&line_dsc);
-    line_dsc.bg_color = lv_color_hex(0x404040);
-    line_dsc.bg_opa = LV_OPA_50;
-    lv_area_t divider = { 0, center_y - 1, CANVAS_WIDTH - 1, center_y };
-    lv_draw_rect(&layer, &line_dsc, &divider);
 
     /* ---- finger marker ---- */
     if (g_touch_x >= 0) {
         lv_draw_rect_dsc_t m;
         lv_draw_rect_dsc_init(&m);
         m.bg_color = lv_color_white();
-        m.bg_opa = LV_OPA_COVER;
+        m.bg_opa = LV_OPA_70;
         m.radius = LV_RADIUS_CIRCLE;
-        const int rr = 10;
+        const int rr = 8;
         lv_area_t ma = { g_touch_x - rr, g_touch_y - rr, g_touch_x + rr, g_touch_y + rr };
         lv_draw_rect(&layer, &m, &ma);
     }
@@ -352,12 +837,10 @@ static void timer_cb(lv_timer_t *timer)
 
 static void build_ui(void)
 {
-    /* Black out the whole screen so there's no white border around the canvas */
     lv_obj_t *scr = lv_screen_active();
     lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
 
-    /* Full-screen 466x466 RGB565 canvas (~434 KB) — allocated in PSRAM by lv_draw_buf_create */
     lv_draw_buf_t *draw_buf = lv_draw_buf_create(CANVAS_WIDTH, CANVAS_HEIGHT, LV_COLOR_FORMAT_RGB565, 0);
     if (!draw_buf) {
         ESP_LOGE(TAG, "Failed to allocate canvas draw buffer");
@@ -369,12 +852,14 @@ static void build_ui(void)
     lv_obj_set_size(canvas, CANVAS_WIDTH, CANVAS_HEIGHT);
     lv_obj_center(canvas);
 
+    build_hex_grid();
+    build_vertices();
     lv_timer_create(timer_cb, 33, canvas);
 }
 
 extern "C" void app_main(void)
 {
-    ESP_LOGI(TAG, "Starting espSynth — polyphonic Karplus-Strong resonator");
+    ESP_LOGI(TAG, "Starting espSynth — Tonnetz hex synth");
 
     lv_display_t *disp = bsp_display_start();
     if (disp) {
