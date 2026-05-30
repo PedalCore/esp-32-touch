@@ -62,8 +62,9 @@ typedef struct {
     float delay;
     int   pluck_n;
     float energy;
-    float phase;   /* synth osc phase 0..1 */
-    float env;     /* synth AR envelope 0..1 */
+    float phase;    /* synth osc phase 0..1 */
+    float modphase; /* FM/AM/RM modulator phase */
+    float env;      /* synth AR envelope 0..1 */
 } voice_t;
 
 static voice_t  V[NUM_VOICES];
@@ -84,6 +85,50 @@ static inline float saw_lerp(float ph)
 static volatile float g_attack    = 8.0f;    /* ms  */
 static volatile float g_release   = 280.0f;  /* ms  */
 static volatile float g_syn_level = 0.55f;   /* 0..1 */
+
+/* ---- wavetable warp / waveshaping (ported from SerumLikeOsc::readWarped) ---- */
+enum { W_NONE, W_SYNC, W_BEND_P, W_BEND_M, W_BEND_PM, W_PWM,
+       W_ASYM_P, W_ASYM_M, W_ASYM_PM, W_FLIP, W_MIRROR, W_QUANT, W_FM, W_AM, W_RM, N_WARP };
+static const char *WARP_NAMES[N_WARP] = {
+    "None","Sync","Bend+","Bend-","Bend+-","PWM","Asym+","Asym-","Asym+-",
+    "Flip","Mirror","Quant","FM","AM","RM"
+};
+static volatile float g_warpmode = 0.0f;   /* stepped 0..N_WARP-1 */
+static volatile float g_warp_base = 0.0f;  /* menu base warp 0..1 */
+static volatile float g_warp_live = 0.0f;  /* live morph from Synth-mode Y */
+
+static inline float w_clamp01(float x) { return x < 0 ? 0 : (x > 1 ? 1 : x); }
+static inline float w_lerp(float a, float b, float t) { return a + (b - a) * t; }
+static inline float w_bias(float b, float x) {
+    b = b < 0.0001f ? 0.0001f : (b > 0.9999f ? 0.9999f : b);
+    x = w_clamp01(x);
+    return x / ((((1.0f / b) - 2.0f) * (1.0f - x)) + 1.0f);
+}
+static inline float w_piece(float x, float mid) {
+    x = w_clamp01(x); mid = mid < 0.0001f ? 0.0001f : (mid > 0.9999f ? 0.9999f : mid);
+    return (x < mid) ? 0.5f * x / mid : 0.5f + 0.5f * ((x - mid) / (1.0f - mid));
+}
+static float osc_warp(float ph, float warp, float ext, int mode)
+{
+    warp = w_clamp01(warp);
+    switch (mode) {
+        case W_SYNC:    return saw_lerp(ph * w_lerp(1.0f, 16.0f, warp * warp * warp));
+        case W_BEND_P:  { float sd = ph > 0.5f ? 0.5f : -0.5f; return saw_lerp(0.5f + sd * w_bias(0.5f + 0.4f * warp, fabsf(ph - 0.5f) * 2.0f)); }
+        case W_BEND_M:  { float sd = ph > 0.5f ? 0.5f : -0.5f; return saw_lerp(0.5f + sd * w_bias(0.5f - 0.4f * warp, fabsf(ph - 0.5f) * 2.0f)); }
+        case W_BEND_PM: { float sd = ph > 0.5f ? 0.5f : -0.5f; return saw_lerp(0.5f + sd * w_bias(w_lerp(0.9f, 0.1f, warp), fabsf(ph - 0.5f) * 2.0f)); }
+        case W_PWM:     { float wd = 1.0f - 0.9999f * warp; float p = ph / wd; if (p > 1) p = 1; return saw_lerp(p); }
+        case W_ASYM_P:  return saw_lerp(w_piece(ph, 0.5f - warp * 0.375f));
+        case W_ASYM_M:  return saw_lerp(w_piece(ph, 0.5f + warp * 0.375f));
+        case W_ASYM_PM: return saw_lerp(w_piece(ph, 0.5f + w_lerp(-1.0f, 1.0f, warp) * 0.375f));
+        case W_FLIP:    { float s = saw_lerp(ph); bool f = ((ph - warp * 2.0f) < 0.0f) && ((ph - warp * 2.0f) > -1.0f); return f ? -s : s; }
+        case W_MIRROR:  { float p2 = 1.0f - 2.0f * fabsf(ph - 0.5f); return saw_lerp(w_piece(p2, 0.5f + w_lerp(-1.0f, 1.0f, warp) * 0.375f)); }
+        case W_QUANT:   { float steps = w_lerp(2.0f, 64.0f, 1.0f - warp); float q = floorf(ph * steps) / steps; return saw_lerp(q); }
+        case W_FM:      return saw_lerp(ph + warp * ext);
+        case W_AM:      return saw_lerp(ph) * w_lerp(1.0f, fabsf(ext), warp);
+        case W_RM:      return saw_lerp(ph) * w_lerp(1.0f, ext, warp);
+        default:        return saw_lerp(ph);
+    }
+}
 
 static inline float frand(void)
 {
@@ -205,6 +250,8 @@ static void audio_engine_task(void *arg)
         float atk    = 1.0f - expf(-1.0f / (fmaxf(0.5f, g_attack)  * 0.001f * SAMPLE_RATE));
         float rel    = 1.0f - expf(-1.0f / (fmaxf(1.0f, g_release) * 0.001f * SAMPLE_RATE));
         float slevel = g_syn_level;
+        int   wmode  = (int)(g_warpmode + 0.5f); if (wmode < 0) wmode = 0; else if (wmode >= N_WARP) wmode = N_WARP - 1;
+        float warp_eff = w_clamp01(g_warp_base + g_warp_live);
         bool  vgate[NUM_VOICES];
         for (int v = 0; v < NUM_VOICES; v++) {
             bool h = false;
@@ -241,10 +288,13 @@ static void audio_engine_task(void *arg)
                 float o;
 
                 if (synth) {
-                    /* ---- saw oscillator + AR envelope ---- */
+                    /* ---- warp oscillator + AR envelope ---- */
                     vc->phase += vc->freq / SAMPLE_RATE;
                     if (vc->phase >= 1.0f) vc->phase -= 1.0f;
-                    float s = saw_lerp(vc->phase);
+                    vc->modphase += vc->freq * 2.0f / SAMPLE_RATE;
+                    if (vc->modphase >= 1.0f) vc->modphase -= 1.0f;
+                    float mod = sinf(6.2831853f * vc->modphase);
+                    float s = osc_warp(vc->phase, warp_eff, mod, wmode);
                     float tgt = vgate[v] ? 1.0f : 0.0f;
                     float c   = vgate[v] ? atk : rel;
                     vc->env += c * (tgt - vc->env);
@@ -494,7 +544,7 @@ static void build_ocarina(void)
 }
 
 /* ============================ params menu ============================ */
-typedef struct { const char *name; volatile float *val; float lo, hi; bool as_pct; } param_t;
+typedef struct { const char *name; volatile float *val; float lo, hi; bool as_pct; const char **names; int nnames; } param_t;
 static param_t PAGE_RES[] = {
     { "Brightness", &g_cutoff,   0.05f, 0.95f,  true  },
     { "Sustain",    &g_feedback, 0.90f, 0.999f, true  },
@@ -503,10 +553,11 @@ static param_t PAGE_RES[] = {
     { "Volume",     &g_volume,   0.00f, 100.0f, false },
 };
 static param_t PAGE_SYN[] = {
-    { "Attack",  &g_attack,    0.5f,  500.0f,  false },
-    { "Release", &g_release,   5.0f,  1000.0f, false },
-    { "Level",   &g_syn_level, 0.00f, 1.00f,   true  },
-    { "Volume",  &g_volume,    0.00f, 100.0f,  false },
+    { "Attack",  &g_attack,    0.5f,  500.0f,            false },
+    { "Release", &g_release,   5.0f,  1000.0f,           false },
+    { "Shape",   &g_warpmode,  0.0f,  (float)(N_WARP-1), false, WARP_NAMES, N_WARP },
+    { "Warp",    &g_warp_base, 0.00f, 1.00f,             true  },
+    { "Volume",  &g_volume,    0.00f, 100.0f,            false },
 };
 #define N_SYN (int)(sizeof(PAGE_SYN) / sizeof(PAGE_SYN[0]))
 static param_t PAGE_FX[] = {
@@ -632,8 +683,12 @@ static void draw_menu(lv_layer_t *layer, int page, int editing_row)
         static char vbuf[8][16];
         int bi = (i < 8) ? i : 7;
         snprintf(nmbuf[bi], sizeof(nmbuf[bi]), "%s", plist[i].name);
-        if (plist[i].as_pct) snprintf(vbuf[bi], sizeof(vbuf[bi]), "%d%%", (int)(t * 100.0f + 0.5f));
-        else                 snprintf(vbuf[bi], sizeof(vbuf[bi]), "%d", (int)v);
+        if (plist[i].names) {
+            int mi2 = (int)(v + 0.5f);
+            if (mi2 < 0) mi2 = 0; else if (mi2 >= plist[i].nnames) mi2 = plist[i].nnames - 1;
+            snprintf(vbuf[bi], sizeof(vbuf[bi]), "%s", plist[i].names[mi2]);
+        } else if (plist[i].as_pct) snprintf(vbuf[bi], sizeof(vbuf[bi]), "%d%%", (int)(t * 100.0f + 0.5f));
+        else                        snprintf(vbuf[bi], sizeof(vbuf[bi]), "%d", (int)v);
         ld.font = &lv_font_montserrat_20;
         ld.color = sel ? lv_color_white() : lv_color_hex(0xc0c8d0);
         ld.align = LV_TEXT_ALIGN_LEFT;
@@ -745,7 +800,9 @@ static void timer_cb(lv_timer_t *timer)
                     if (ty >= y0 - 6 && ty <= y1 + 6) {
                         float t = (float)(tx - MENU_MARGIN) / (float)(CANVAS_WIDTH - 2 * MENU_MARGIN);
                         if (t < 0) t = 0; else if (t > 1) t = 1;
-                        *eplist[i].val = eplist[i].lo + t * (eplist[i].hi - eplist[i].lo);
+                        float nv = eplist[i].lo + t * (eplist[i].hi - eplist[i].lo);
+                        if (eplist[i].names) nv = floorf(nv + 0.5f);   /* stepped selector */
+                        *eplist[i].val = nv;
                         editing_row = i;
                         break;
                     }
@@ -774,8 +831,17 @@ static void timer_cb(lv_timer_t *timer)
         } else {
             g_active_note = -1; g_finger_down = 0; prev_sig = -1;
         }
-    } else if (play_touch && (g_mode == MODE_XY || g_mode == MODE_SYNTH)) {
-        /* Keys+Spectrum / Synth: top half = scale note (pentatonic, 3 oct), bottom half = filter */
+    } else if (play_touch && g_mode == MODE_SYNTH) {
+        /* Synth 2D pad: X = scale note, Y = warp morph (real-time waveshaping) */
+        g_touch_x = tx; g_touch_y = ty;
+        float xn = (float)tx / CANVAS_WIDTH;             if (xn < 0) xn = 0; else if (xn > 1) xn = 1;
+        float yn = (float)ty / (float)(CANVAS_HEIGHT - NAV_H); if (yn < 0) yn = 0; else if (yn > 1) yn = 1;
+        int idx = (int)(xn * XY_NOTES); if (idx < 0) idx = 0; else if (idx >= XY_NOTES) idx = XY_NOTES - 1;
+        if (idx != g_active_note) { float f = xy_note_freq(idx); chord_push(1, &f); g_active_note = idx; }
+        g_warp_live = yn;
+        g_finger_down = 1;
+    } else if (play_touch && g_mode == MODE_XY) {
+        /* Keys+Spectrum: top half = scale note (pentatonic, 3 oct), bottom half = filter */
         g_touch_x = tx; g_touch_y = ty;
         const int cy = CANVAS_HEIGHT / 2;
         float txn = (float)tx / CANVAS_WIDTH;
